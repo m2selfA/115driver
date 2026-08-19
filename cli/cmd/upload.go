@@ -19,6 +19,8 @@ var (
 	uploadInterfaces string
 	uploadChunkSize  string
 	uploadTimeout    time.Duration
+	uploadRecursive  bool
+	uploadSession    string
 )
 
 func buildUploadOptions(config auth.TransferConfig, interfacesOverride, chunkSizeOverride string, timeout time.Duration) (uploadpkg.Options, error) {
@@ -56,8 +58,8 @@ func buildUploadOptions(config auth.TransferConfig, interfacesOverride, chunkSiz
 
 var uploadCmd = &cobra.Command{
 	Use:   "upload <local_path> <remote_dir>",
-	Short: "Upload a file to remote directory",
-	Long:  "Upload a file with 115 rapid-upload first. If OSS data transfer is required, the default automatically selects reachable interfaces and uses one multipart worker per physical interface.",
+	Short: "Upload a file or recursively upload a directory",
+	Long:  "Upload with 115 rapid-upload first. If OSS data transfer is required, the default automatically selects reachable interfaces and uses one multipart worker per physical interface. Use --recursive for directories; resumable transfer sessions are enabled by transfer.resume.",
 	Args:  cobra.ExactArgs(2),
 	RunE: func(cmd *cobra.Command, args []string) error {
 		localPath := args[0]
@@ -67,22 +69,6 @@ var uploadCmd = &cobra.Command{
 		if err != nil {
 			return &exitError{code: output.ExitNotFound, msg: fmt.Sprintf("Remote directory not found: %s", remoteDir)}
 		}
-
-		f, err := os.Open(localPath)
-		if err != nil {
-			return &exitError{code: output.ExitArgs, msg: fmt.Sprintf("Cannot open local file: %v", err)}
-		}
-		defer f.Close()
-
-		stat, err := f.Stat()
-		if err != nil {
-			return &exitError{code: output.ExitError, msg: err.Error()}
-		}
-		if stat.IsDir() {
-			return &exitError{code: output.ExitArgs, msg: "Directory upload is not supported. Upload individual files."}
-		}
-
-		fileName := filepath.Base(localPath)
 		transferConfig, err := auth.ResolveTransferConfig(configPath)
 		if err != nil {
 			return &exitError{code: output.ExitArgs, msg: err.Error()}
@@ -91,27 +77,79 @@ var uploadCmd = &cobra.Command{
 		if err != nil {
 			return &exitError{code: output.ExitArgs, msg: err.Error()}
 		}
+		if strings.TrimSpace(uploadSession) != "" && !transferConfig.Resume {
+			return &exitError{code: output.ExitArgs, msg: "--session requires transfer.resume=true"}
+		}
 		if !jsonOutput {
-			fmt.Printf("Uploading %s (%s)...\n", fileName, output.FormatFileSize(stat.Size()))
 			uploadOptions.Progress = func(message string) { fmt.Fprintln(os.Stderr, message) }
 		}
 
+		stat, err := os.Lstat(localPath)
+		if err != nil {
+			return &exitError{code: output.ExitArgs, msg: fmt.Sprintf("Cannot stat local path: %v", err)}
+		}
+		if stat.Mode()&os.ModeSymlink != 0 {
+			return &exitError{code: output.ExitArgs, msg: "Symbolic-link upload sources are not supported"}
+		}
+		if stat.IsDir() {
+			if !uploadRecursive {
+				return &exitError{code: output.ExitArgs, msg: "Local path is a directory; use --recursive to upload its contents"}
+			}
+			summary, err := executeRecursiveUpload(cmd.Context(), client, client, localPath, remoteDir, dirID, transferConfig.Resume, uploadSession, uploadOptions, defaultUploadPipelineDeps())
+			if err != nil {
+				message := fmt.Sprintf("Upload failed: %v", err)
+				if len(summary.Failures) > 0 {
+					message = fmt.Sprintf("%s; first failed file %s: %v", message, summary.Failures[0].RelativePath, summary.Failures[0].Err)
+				}
+				return &exitError{code: output.ExitError, msg: message}
+			}
+			printer.PrintSuccess(map[string]interface{}{
+				"local_path": localPath, "remote_dir": remoteDir, "files": summary.FileCount,
+				"succeeded": summary.SucceededCount, "rapid": summary.RapidCount, "resumed": summary.ResumedCount,
+				"size": summary.TotalBytes,
+			})
+			if !jsonOutput {
+				fmt.Printf("Upload complete: %d files (%s) -> %s\n", summary.SucceededCount, output.FormatFileSize(summary.TotalBytes), remoteDir)
+			}
+			return nil
+		}
+		if !stat.Mode().IsRegular() {
+			return &exitError{code: output.ExitArgs, msg: "Local upload source must be a regular file"}
+		}
+
+		fileName := filepath.Base(localPath)
+		if transferConfig.Resume {
+			sessionPath, _, err := deriveTransferSessionPaths("upload", localPath, remoteDir, uploadSession)
+			if err != nil {
+				return &exitError{code: output.ExitArgs, msg: err.Error()}
+			}
+			uploadOptions.ResumePath = sessionPath
+		}
+		if !jsonOutput {
+			fmt.Printf("Uploading %s (%s)...\n", fileName, output.FormatFileSize(stat.Size()))
+		}
+		f, err := os.Open(localPath)
+		if err != nil {
+			return &exitError{code: output.ExitArgs, msg: fmt.Sprintf("Cannot open local file: %v", err)}
+		}
+		defer f.Close()
 		uploadResult, err := uploadpkg.UploadFile(cmd.Context(), client, dirID, fileName, stat.Size(), f, uploadOptions)
 		if err != nil {
 			return &exitError{code: output.ExitError, msg: fmt.Sprintf("Upload failed: %v", err)}
+		}
+		if uploadOptions.ResumePath != "" {
+			if cleanupErr := uploadpkg.RemoveResumeState(uploadOptions.ResumePath); cleanupErr != nil && uploadOptions.Progress != nil {
+				uploadOptions.Progress(fmt.Sprintf("Warning: upload succeeded but resume state cleanup failed: %v", cleanupErr))
+			}
 		}
 		interfaces := make([]string, 0, len(uploadResult.NetworkPaths))
 		for _, path := range uploadResult.NetworkPaths {
 			interfaces = append(interfaces, path.String())
 		}
 		printer.PrintSuccess(map[string]interface{}{
-			"local_path": localPath,
-			"remote_dir": remoteDir,
-			"size":       stat.Size(),
-			"rapid":      uploadResult.Rapid,
-			"multipart":  uploadResult.Multipart,
-			"parts":      uploadResult.PartCount,
-			"interfaces": interfaces,
+			"local_path": localPath, "remote_dir": remoteDir, "size": stat.Size(), "rapid": uploadResult.Rapid,
+			"multipart": uploadResult.Multipart, "parts": uploadResult.PartCount, "resumed": uploadResult.Resumed,
+			"resumed_parts": uploadResult.ResumedParts, "interfaces": interfaces,
 		})
 		if !jsonOutput {
 			fmt.Printf("Upload complete: %s -> %s\n", fileName, remoteDir)
@@ -121,6 +159,8 @@ var uploadCmd = &cobra.Command{
 }
 
 func init() {
+	uploadCmd.Flags().BoolVarP(&uploadRecursive, "recursive", "r", false, "Recursively upload a directory's contents while preserving hierarchy")
+	uploadCmd.Flags().StringVar(&uploadSession, "session", "", "Override persistent upload session file path (requires transfer.resume=true)")
 	uploadCmd.Flags().StringVar(&uploadInterfaces, "interfaces", "", "Override upload interfaces (auto, or comma-separated interface names/indexes/IPs)")
 	uploadCmd.Flags().StringVar(&uploadChunkSize, "chunk-size", "", "Override OSS multipart part size (for example 32MiB)")
 	uploadCmd.Flags().DurationVar(&uploadTimeout, "timeout", uploadpkg.DefaultTimeout, "Upload timeout, use 0 to disable")

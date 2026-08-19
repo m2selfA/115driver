@@ -18,6 +18,8 @@ type Result struct {
 	Rapid         bool
 	Multipart     bool
 	Sequential    bool
+	Resumed       bool
+	ResumedParts  int
 	BytesUploaded int64
 	PartCount     int
 	ChunkSize     int64
@@ -31,7 +33,7 @@ type Result struct {
 // interfaces. Multi-interface uploads use ordinary concurrent multipart upload;
 // the 115 callback receives the already-computed whole-file SHA1 instead of
 // relying on OSS sequential hash context.
-func UploadFile(ctx context.Context, client *driver.Pan115Client, dirID, fileName string, fileSize int64, file *os.File, options Options) (Result, error) {
+func uploadFileWithoutResume(ctx context.Context, client *driver.Pan115Client, dirID, fileName string, fileSize int64, file *os.File, options Options) (Result, error) {
 	started := time.Now()
 	result := Result{}
 	if client == nil {
@@ -164,7 +166,7 @@ func UploadFile(ctx context.Context, client *driver.Pan115Client, dirID, fileNam
 
 	report, scheduleErr := transfer.ScheduleUploadParts(ctx, selection.Paths, jobs, func(ctx context.Context, path transfer.NetworkPath, job transfer.UploadPartJob) (transfer.UploadPartResult, error) {
 		return uploadPartWithRefresh(ctx, pool, imur, file, path, job)
-	}, transfer.WithUploadPartRetries(options.Retries), transfer.WithUploadPartHealthTracker(options.HealthTracker))
+	}, transfer.WithUploadPartRetries(options.Retries), transfer.WithUploadPartHealthTracker(options.HealthTracker), transfer.WithUploadPartPreserveOrder(sequential))
 	if scheduleErr != nil {
 		return result, scheduleErr
 	}

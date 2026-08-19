@@ -130,6 +130,141 @@ func TestExecuteDownloadCommandRecursiveWiresP1P2P4AndPreservesTree(t *testing.T
 	}
 }
 
+func TestExecuteDownloadCommandRecursiveSessionSkipsCompletedFilesOnSecondRun(t *testing.T) {
+	client := &fakeDownloadCommandClient{
+		dirIDs: map[string]string{"root": "d1"},
+		lists: map[string][]driver.File{
+			"d1": {
+				{FileID: "fa", Name: "a.bin", PickCode: "pa", Size: 4, Sha1: "AAAA"},
+				{FileID: "fb", Name: "b.bin", PickCode: "pb", Size: 6, Sha1: "BBBB"},
+			},
+		},
+		downloads: map[string]*driver.DownloadInfo{
+			"pa": testDriverDownloadInfo("a.bin", 4, "https://cdn.example.invalid/a?token=1"),
+			"pb": testDriverDownloadInfo("b.bin", 6, "https://cdn.example.invalid/b?token=2"),
+		},
+	}
+	iface := testCLIPath("Ethernet", 1, "10.0.0.1")
+	var firstRun = true
+	var scheduledRuns [][]string
+	deps := downloadPipelineDeps{
+		discoverNetworkPaths: func(context.Context) (transfer.NetworkDiscoveryResult, error) {
+			return transfer.NetworkDiscoveryResult{Paths: []transfer.NetworkPath{iface}, Probes: []transfer.NetworkPathProbe{{Path: iface, Reachable: true}}}, nil
+		},
+		listNetworkPaths: func() ([]transfer.NetworkPath, error) { return nil, errors.New("manual listing should not run") },
+		probeCDNPaths: func(_ context.Context, _ string, _ http.Header, _ []transfer.NetworkPath, _ *transfer.CDNProbeCache, _ ...transfer.CDNProbeOption) (transfer.CDNDiscoveryResult, error) {
+			return transfer.CDNDiscoveryResult{Host: "cdn.example.invalid", Paths: []transfer.NetworkPath{iface}}, nil
+		},
+		scheduleFiles: func(_ context.Context, _ []transfer.NetworkPath, jobs []transfer.FileTransferJob, opts ...transfer.FileSchedulerOption) (transfer.FileScheduleReport, error) {
+			options := transfer.DefaultFileSchedulerOptions()
+			for _, opt := range opts {
+				opt(&options)
+			}
+			ids := make([]string, len(jobs))
+			report := transfer.FileScheduleReport{Results: make([]transfer.FileScheduleResult, len(jobs))}
+			failed := 0
+			for i, job := range jobs {
+				ids[i] = job.ID
+				result := transfer.FileScheduleResult{JobID: job.ID, DestinationPath: job.DestinationPath, ExpectedSize: job.ExpectedSize}
+				if firstRun && job.ID == "fb" {
+					result.Err = errors.New("simulated disconnect")
+					failed++
+					report.Results[i] = result
+					continue
+				}
+				if err := os.WriteFile(job.DestinationPath, []byte(strings.Repeat("x", int(job.ExpectedSize))), 0600); err != nil {
+					t.Fatal(err)
+				}
+				result.Result = transfer.FileDownloadResult{DestinationPath: job.DestinationPath, BytesWritten: job.ExpectedSize, NetworkPath: iface}
+				if options.SuccessHook != nil {
+					if err := options.SuccessHook(result); err != nil {
+						result.Err = err
+						failed++
+					}
+				}
+				report.Results[i] = result
+			}
+			scheduledRuns = append(scheduledRuns, ids)
+			if failed > 0 {
+				return report, transfer.ErrFileScheduleIncomplete
+			}
+			return report, nil
+		},
+		downloadChunks: func(context.Context, transfer.ChunkDownloadRequest) (transfer.ChunkDownloadResult, error) {
+			t.Fatal("chunk downloader should not run")
+			return transfer.ChunkDownloadResult{}, nil
+		},
+	}
+	root := filepath.Join(t.TempDir(), "download-root")
+	sessionPath := filepath.Join(t.TempDir(), "recursive-download.session.json")
+	options := testDownloadCommandOptions(true)
+	options.SessionPath = sessionPath
+
+	first, err := executeDownloadCommand(context.Background(), client, "/root", root, options, deps)
+	if err == nil {
+		t.Fatalf("expected first run failure, got %#v", first)
+	}
+	if first.SucceededCount != 1 || first.FailedCount != 1 || first.SessionPath != sessionPath {
+		t.Fatalf("unexpected first session summary: %#v", first)
+	}
+	if _, err := os.Stat(sessionPath); err != nil {
+		t.Fatalf("failed directory session was not preserved: %v", err)
+	}
+
+	firstRun = false
+	second, err := executeDownloadCommand(context.Background(), client, "/root", root, options, deps)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second.FileCount != 2 || second.SucceededCount != 2 || second.ResumedCount != 1 || second.TotalBytes != 10 || second.SessionPath != "" {
+		t.Fatalf("unexpected resumed download summary: %#v", second)
+	}
+	if len(scheduledRuns) != 2 || !reflect.DeepEqual(scheduledRuns[0], []string{"fa", "fb"}) || !reflect.DeepEqual(scheduledRuns[1], []string{"fb"}) {
+		t.Fatalf("completed file was scheduled again: %#v", scheduledRuns)
+	}
+	if _, err := os.Stat(sessionPath); !os.IsNotExist(err) {
+		t.Fatalf("successful directory session was not cleaned: %v", err)
+	}
+}
+
+func TestPrepareRecursiveDownloadSessionResetsCompletedFileWhenLocalCopyChanges(t *testing.T) {
+	root := t.TempDir()
+	remote := remoteDownloadTree{Directories: []string{""}, Files: []remoteDownloadFile{{
+		File: driver.File{FileID: "fa", Name: "a.bin", PickCode: "pa", Size: 4, Sha1: "70C881D4A26984DDCE795F6F71817C9CF4480E79"}, RelativePath: "a.bin", RemotePath: "/root/a.bin",
+	}}}
+	sessionPath := filepath.Join(t.TempDir(), "download.session.json")
+	session, pending, _, _, err := prepareRecursiveDownloadSession("/root", root, remote, "file", sessionPath)
+	if err != nil || len(pending) != 1 {
+		t.Fatalf("unexpected initial session: pending=%v err=%v", pending, err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "a.bin"), []byte("aaaa"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := markDownloadSessionCompleted(session, "a.bin", filepath.Join(root, "a.bin"), 4); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "a.bin"), []byte("zzzz"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	_, pending, resumed, _, err := prepareRecursiveDownloadSession("/root", root, remote, "file", sessionPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resumed != 0 || len(pending) != 1 {
+		t.Fatalf("changed completed file was incorrectly trusted: resumed=%d pending=%#v", resumed, pending)
+	}
+}
+
+func TestPrepareRecursiveDownloadSessionRejectsSessionInsideDestination(t *testing.T) {
+	root := t.TempDir()
+	tree := remoteDownloadTree{Directories: []string{""}}
+	inside := filepath.Join(root, "session.json")
+	_, _, _, _, err := prepareRecursiveDownloadSession("/root", root, tree, "file", inside)
+	if !errors.Is(err, errDownloadUsage) {
+		t.Fatalf("expected in-destination session rejection, got %v", err)
+	}
+}
+
 func TestExecuteDownloadCommandEmptyDirectorySkipsNetworkDiscovery(t *testing.T) {
 	client := &fakeDownloadCommandClient{
 		dirIDs: map[string]string{"empty": "d1"},
@@ -267,6 +402,9 @@ func TestExecuteDownloadCommandChunkUsesLiveRangePathsAndChunkSettings(t *testin
 			captured = request
 			if request.HealthTracker == nil {
 				t.Fatal("chunk downloader did not receive P8 health tracker")
+			}
+			if err := os.WriteFile(request.DestinationPath, []byte(strings.Repeat("x", int(request.ExpectedSize))), 0600); err != nil {
+				t.Fatal(err)
 			}
 			return transfer.ChunkDownloadResult{DestinationPath: request.DestinationPath, BytesWritten: request.ExpectedSize, ChunkSize: request.ChunkSize, ChunkCount: 2}, nil
 		},

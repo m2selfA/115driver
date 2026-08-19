@@ -362,6 +362,82 @@ func TestSelectManualPathsMatchesNameIndexAndIP(t *testing.T) {
 	}
 }
 
+func TestListUploadedPartsPaginatesAndReconcilesMissingJobs(t *testing.T) {
+	path := transfer.NetworkPath{InterfaceName: "Ethernet", InterfaceIndex: 1, LocalIP: net.ParseIP("10.0.0.1")}
+	pool := newOSSBucketPool(nil, "http://oss.example.invalid", "bucket")
+	pool.token = &driver.UploadOSSTokenResp{AccessKeyID: "ak", AccessKeySecret: "secret", SecurityToken: "sts", Expiration: time.Now().Add(time.Hour)}
+	pool.generation = 1
+	pool.refreshed = time.Now()
+	defer pool.close()
+	var calls atomic.Int32
+	pool.transportFactory = func(transfer.NetworkPath) (http.RoundTripper, error) {
+		return uploadRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+			calls.Add(1)
+			if req.Method != http.MethodGet || req.URL.Query().Get("uploadId") != "upload-id" {
+				t.Fatalf("unexpected list request: %s %s", req.Method, req.URL)
+			}
+			if req.Header.Get(driver.OssSecurityTokenHeaderName) != "sts" {
+				t.Fatalf("missing STS token on ListUploadedParts: %#v", req.Header)
+			}
+			marker := req.URL.Query().Get("part-number-marker")
+			switch marker {
+			case "":
+				return uploadTestHTTPResponse(req, http.StatusOK, http.Header{}, `<ListPartsResult><Bucket>bucket</Bucket><Key>object</Key><UploadId>upload-id</UploadId><NextPartNumberMarker>1</NextPartNumberMarker><MaxParts>1000</MaxParts><IsTruncated>true</IsTruncated><Part><PartNumber>1</PartNumber><ETag>etag-1</ETag><Size>3</Size></Part></ListPartsResult>`), nil
+			case "1":
+				return uploadTestHTTPResponse(req, http.StatusOK, http.Header{}, `<ListPartsResult><Bucket>bucket</Bucket><Key>object</Key><UploadId>upload-id</UploadId><NextPartNumberMarker>3</NextPartNumberMarker><MaxParts>1000</MaxParts><IsTruncated>false</IsTruncated><Part><PartNumber>3</PartNumber><ETag>etag-3</ETag><Size>2</Size></Part></ListPartsResult>`), nil
+			default:
+				t.Fatalf("unexpected part marker %q", marker)
+				return nil, nil
+			}
+		}), nil
+	}
+
+	listed, err := listUploadedParts(context.Background(), pool, []transfer.NetworkPath{path}, oss.InitiateMultipartUploadResult{Bucket: "bucket", Key: "object", UploadID: "upload-id"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if calls.Load() != 2 || len(listed) != 2 {
+		t.Fatalf("unexpected paginated result: calls=%d parts=%#v", calls.Load(), listed)
+	}
+	jobs := []transfer.UploadPartJob{
+		{PartNumber: 1, Offset: 0, Size: 3},
+		{PartNumber: 2, Offset: 3, Size: 3},
+		{PartNumber: 3, Offset: 6, Size: 2},
+	}
+	existing, missing, err := reconcileUploadedParts(jobs, listed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(existing) != 2 || existing[0].PartNumber != 1 || existing[1].PartNumber != 3 {
+		t.Fatalf("unexpected existing parts: %#v", existing)
+	}
+	if len(missing) != 1 || missing[0].PartNumber != 2 {
+		t.Fatalf("resume did not isolate the missing part: %#v", missing)
+	}
+}
+
+func TestReconcileUploadedPartsRejectsMismatchedRemoteLayout(t *testing.T) {
+	jobs := []transfer.UploadPartJob{{PartNumber: 1, Offset: 0, Size: 4}}
+	_, _, err := reconcileUploadedParts(jobs, []listedUploadPart{{Part: oss.UploadPart{PartNumber: 1, ETag: "etag"}, Size: 3}})
+	if !errors.Is(err, ErrUploadResumeState) {
+		t.Fatalf("expected resume layout error, got %v", err)
+	}
+}
+
+func TestIsOSSNoSuchUploadAcceptsValueAndPointer(t *testing.T) {
+	for _, err := range []error{
+		oss.ServiceError{Code: "NoSuchUpload", StatusCode: http.StatusNotFound},
+		&oss.ServiceError{Code: "NoSuchUpload", StatusCode: http.StatusNotFound},
+	} {
+		if !isOSSNoSuchUpload(err) {
+			t.Fatalf("expected NoSuchUpload classification for %T", err)
+		}
+	}
+	if isOSSNoSuchUpload(oss.ServiceError{Code: "AccessDenied", StatusCode: http.StatusForbidden}) {
+		t.Fatal("unrelated OSS error was classified as NoSuchUpload")
+	}
+}
+
 func TestParseUploadCallbackRejectsSHA1Mismatch(t *testing.T) {
 	body := []byte(`{"state":true,"data":{"sha1":"WRONG"}}`)
 	if err := parseUploadCallback(body, "EXPECTED"); err == nil {

@@ -155,6 +155,49 @@ func TestScheduleFileDownloadsUsesOneConcurrentWorkerPerInterface(t *testing.T) 
 	}
 }
 
+func TestScheduleFileDownloadsSuccessHookRunsImmediatelyAndHookFailureStopsPending(t *testing.T) {
+	dir := t.TempDir()
+	paths := []NetworkPath{testNetworkPath(1, "10.0.0.1")}
+	jobs := []FileTransferJob{
+		testScheduledFileJob(dir, "first", 30),
+		testScheduledFileJob(dir, "second", 20),
+		testScheduledFileJob(dir, "third", 10),
+	}
+	var downloaded []string
+	download := func(_ context.Context, request FileDownloadRequest) (FileDownloadResult, error) {
+		downloaded = append(downloaded, filepath.Base(request.DestinationPath))
+		return successfulScheduledDownload(request), nil
+	}
+	hookErr := errors.New("session fsync failed")
+	var hooked []string
+	report, err := scheduleFileDownloads(
+		context.Background(), paths, jobs, download,
+		WithFileScheduleRetries(0),
+		WithFileScheduleSuccessHook(func(result FileScheduleResult) error {
+			hooked = append(hooked, result.JobID)
+			if result.JobID == "first" {
+				return hookErr
+			}
+			return nil
+		}),
+	)
+	if !errors.Is(err, ErrFileScheduleIncomplete) {
+		t.Fatalf("expected schedule failure, got %v", err)
+	}
+	if len(downloaded) != 1 || downloaded[0] != "first.bin" {
+		t.Fatalf("new jobs continued after durable hook failure: %v", downloaded)
+	}
+	if len(hooked) != 1 || hooked[0] != "first" {
+		t.Fatalf("unexpected hook calls: %v", hooked)
+	}
+	if len(report.Results) != 3 || !errors.Is(report.Results[0].Err, hookErr) {
+		t.Fatalf("hook failure was not attached to first job: %#v", report.Results)
+	}
+	if !errors.Is(report.Results[1].Err, context.Canceled) || !errors.Is(report.Results[2].Err, context.Canceled) {
+		t.Fatalf("pending jobs were not cancelled after hook failure: %#v", report.Results)
+	}
+}
+
 func TestScheduleFileDownloadsUsesPerJobCDNPaths(t *testing.T) {
 	dir := t.TempDir()
 	paths := []NetworkPath{

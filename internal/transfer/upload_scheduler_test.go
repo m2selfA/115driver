@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -87,6 +88,50 @@ func TestScheduleUploadPartsRetriesNetworkFailureOnDifferentInterface(t *testing
 	}
 	if !errors.Is(attempts[0].Err, ErrNetworkPathFailure) {
 		t.Fatalf("network error was not classified for P8: %v", attempts[0].Err)
+	}
+}
+
+func TestScheduleUploadPartsPreserveOrderRetriesBeforeLaterParts(t *testing.T) {
+	path := testNetworkPath(1, "10.0.0.1")
+	jobs := []UploadPartJob{
+		{PartNumber: 1, Offset: 0, Size: 4},
+		{PartNumber: 2, Offset: 4, Size: 4},
+		{PartNumber: 3, Offset: 8, Size: 4},
+	}
+	var mu sync.Mutex
+	var order []int
+	failedFirst := false
+	report, err := ScheduleUploadParts(context.Background(), []NetworkPath{path}, jobs, func(_ context.Context, _ NetworkPath, job UploadPartJob) (UploadPartResult, error) {
+		mu.Lock()
+		order = append(order, job.PartNumber)
+		mu.Unlock()
+		if job.PartNumber == 1 && !failedFirst {
+			failedFirst = true
+			return UploadPartResult{}, errors.New("transient part error")
+		}
+		return UploadPartResult{PartNumber: job.PartNumber, ETag: fmt.Sprintf("etag-%d", job.PartNumber), BytesUploaded: job.Size}, nil
+	}, WithUploadPartRetries(1), WithUploadPartPreserveOrder(true))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.SucceededCount() != 3 {
+		t.Fatalf("unexpected report: %#v", report)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	want := []int{1, 1, 2, 3}
+	if fmt.Sprint(order) != fmt.Sprint(want) {
+		t.Fatalf("sequential retry moved behind later parts: got %v want %v", order, want)
+	}
+}
+
+func TestScheduleUploadPartsPreserveOrderRejectsMultipleInterfaces(t *testing.T) {
+	paths := []NetworkPath{testNetworkPath(1, "10.0.0.1"), testNetworkPath(2, "10.0.0.2")}
+	_, err := ScheduleUploadParts(context.Background(), paths, []UploadPartJob{{PartNumber: 1, Offset: 0, Size: 1}}, func(context.Context, NetworkPath, UploadPartJob) (UploadPartResult, error) {
+		return UploadPartResult{}, nil
+	}, WithUploadPartPreserveOrder(true))
+	if err == nil || !strings.Contains(err.Error(), "exactly one network path") {
+		t.Fatalf("expected ordered multi-interface rejection, got %v", err)
 	}
 }
 

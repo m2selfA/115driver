@@ -22,12 +22,13 @@ var (
 	downloadInterfaces string
 	downloadStrategy   string
 	downloadChunkSize  string
+	downloadSession    string
 )
 
 var downloadCmd = &cobra.Command{
 	Use:   "download <remote_path> <local_path>",
 	Short: "Download a file or recursively download a directory",
-	Long:  "Download through the configured transfer strategy. 'file' assigns whole files across interfaces; 'chunk' splits each file into HTTP byte ranges and aggregates all Range-capable interfaces. For directories, use --recursive; directory contents are written below local_path.",
+	Long:  "Download through the configured transfer strategy. 'file' assigns whole files across interfaces; 'chunk' splits each file into HTTP byte ranges and aggregates all Range-capable interfaces. For directories, use --recursive; directory contents are written below local_path and transfer.resume maintains a persistent resumable directory session.",
 	Args:  cobra.ExactArgs(2),
 	RunE: func(cmd *cobra.Command, args []string) error {
 		if err := validateDownloadTimeout(downloadTimeout); err != nil {
@@ -64,6 +65,7 @@ var downloadCmd = &cobra.Command{
 			HealthCooldown:      transferConfig.HealthCooldown,
 			HealthCooldownMax:   transferConfig.HealthCooldownMax,
 			Resume:              transferConfig.Resume,
+			SessionPath:         downloadSession,
 			URLRefreshes:        transferConfig.URLRefreshes,
 		}
 		if !jsonOutput {
@@ -98,6 +100,7 @@ var downloadCmd = &cobra.Command{
 			"interfaces":  summary.Interfaces,
 			"files":       summary.FileCount,
 			"succeeded":   summary.SucceededCount,
+			"resumed":     summary.ResumedCount,
 			"size":        summary.TotalBytes,
 		})
 		if !jsonOutput {
@@ -125,6 +128,7 @@ func validateDownloadTimeout(timeout time.Duration) error {
 func init() {
 	downloadCmd.Flags().DurationVar(&downloadTimeout, "timeout", defaultDownloadTimeout, "Download timeout per file, use 0 to disable")
 	downloadCmd.Flags().BoolVarP(&downloadRecursive, "recursive", "r", false, "Recursively download a directory into local_path")
+	downloadCmd.Flags().StringVar(&downloadSession, "session", "", "Override persistent recursive-download session file path (requires transfer.resume=true)")
 	downloadCmd.Flags().StringVar(&downloadInterfaces, "interfaces", "", "Override transfer interfaces (auto, or comma-separated interface names/indexes/IPs)")
 	downloadCmd.Flags().StringVar(&downloadStrategy, "strategy", "", "Override transfer strategy (file or chunk)")
 	downloadCmd.Flags().StringVar(&downloadChunkSize, "chunk-size", "", "Override chunk strategy range size (for example 32MiB)")

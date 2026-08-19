@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -199,6 +200,75 @@ func uploadPartWithRefresh(ctx context.Context, pool *ossBucketPool, imur oss.In
 		return transfer.UploadPartResult{}, errors.Join(err, refreshErr)
 	}
 	return upload(refreshed)
+}
+
+var ErrUploadMultipartGone = errors.New("OSS multipart upload no longer exists")
+
+func isOSSNoSuchUpload(err error) bool {
+	var serviceError oss.ServiceError
+	if errors.As(err, &serviceError) && serviceError.Code == "NoSuchUpload" {
+		return true
+	}
+	var serviceErrorPtr *oss.ServiceError
+	return errors.As(err, &serviceErrorPtr) && serviceErrorPtr != nil && serviceErrorPtr.Code == "NoSuchUpload"
+}
+
+type listedUploadPart struct {
+	Part oss.UploadPart
+	Size int64
+}
+
+func listUploadedParts(ctx context.Context, pool *ossBucketPool, paths []transfer.NetworkPath, imur oss.InitiateMultipartUploadResult) ([]listedUploadPart, error) {
+	var errs []error
+	for _, path := range paths {
+		snapshot, err := pool.snapshot(path)
+		if err != nil {
+			errs = append(errs, err)
+			continue
+		}
+		list := func(current ossBucketSnapshot) ([]listedUploadPart, error) {
+			parts := make([]listedUploadPart, 0)
+			marker := 0
+			for {
+				opts := append(ossRequestOptions(ctx, current.token), oss.MaxParts(1000))
+				if marker > 0 {
+					opts = append(opts, oss.PartNumberMarker(marker))
+				}
+				listed, err := current.handle.bucket.ListUploadedParts(imur, opts...)
+				if err != nil {
+					return nil, err
+				}
+				for _, part := range listed.UploadedParts {
+					parts = append(parts, listedUploadPart{Part: oss.UploadPart{PartNumber: part.PartNumber, ETag: part.ETag}, Size: int64(part.Size)})
+				}
+				if !listed.IsTruncated {
+					return parts, nil
+				}
+				next, err := strconv.Atoi(listed.NextPartNumberMarker)
+				if err != nil || next <= marker {
+					return nil, fmt.Errorf("invalid OSS next part marker %q", listed.NextPartNumberMarker)
+				}
+				marker = next
+			}
+		}
+		parts, err := list(snapshot)
+		if isOSSAuthError(err) {
+			refreshed, refreshErr := pool.refreshIfStale(path, snapshot.generation)
+			if refreshErr != nil {
+				err = errors.Join(err, refreshErr)
+			} else {
+				parts, err = list(refreshed)
+			}
+		}
+		if err == nil {
+			return parts, nil
+		}
+		if isOSSNoSuchUpload(err) {
+			return nil, errors.Join(ErrUploadMultipartGone, err)
+		}
+		errs = append(errs, fmt.Errorf("list multipart parts through %s: %w", path, err))
+	}
+	return nil, errors.Join(errs...)
 }
 
 func initiateMultipart(ctx context.Context, pool *ossBucketPool, paths []transfer.NetworkPath, object string, sequential bool) (oss.InitiateMultipartUploadResult, error) {

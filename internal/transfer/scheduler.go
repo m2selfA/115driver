@@ -46,6 +46,7 @@ type FileSchedulerOptions struct {
 	Retries       int
 	LargestFirst  bool
 	HealthTracker *NetworkHealthTracker
+	SuccessHook   func(FileScheduleResult) error
 }
 
 // DefaultFileSchedulerOptions returns the defaults for the stable coarse-grain
@@ -80,6 +81,16 @@ func WithFileScheduleLargestFirst(enabled bool) FileSchedulerOption {
 func WithFileScheduleHealthTracker(tracker *NetworkHealthTracker) FileSchedulerOption {
 	return func(options *FileSchedulerOptions) {
 		options.HealthTracker = tracker
+	}
+}
+
+// WithFileScheduleSuccessHook persists or observes a file immediately after its
+// data transfer succeeds. A hook error turns that job into a failure and stops
+// dispatching new work, which prevents callers from claiming durable session
+// progress that was not actually recorded.
+func WithFileScheduleSuccessHook(hook func(FileScheduleResult) error) FileSchedulerOption {
+	return func(options *FileSchedulerOptions) {
+		options.SuccessHook = hook
 	}
 }
 
@@ -297,6 +308,16 @@ func scheduleFileDownloads(
 		if workerResult.attempt.Err == nil {
 			options.HealthTracker.RecordSuccess(workerResult.attempt.NetworkPath)
 			state.done = true
+			if options.SuccessHook != nil {
+				hookResult := FileScheduleResult{
+					JobID: state.job.ID, DestinationPath: state.job.DestinationPath, ExpectedSize: state.job.ExpectedSize,
+					Attempts: append([]FileScheduleAttempt(nil), state.attempts...), Result: state.result,
+				}
+				if hookErr := options.SuccessHook(hookResult); hookErr != nil {
+					state.err = fmt.Errorf("persist successful file %q: %w", state.job.ID, hookErr)
+					cancelled = true
+				}
+			}
 			completed++
 			continue
 		}

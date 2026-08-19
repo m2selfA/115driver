@@ -66,6 +66,7 @@ type downloadCommandOptions struct {
 	HealthCooldown      time.Duration
 	HealthCooldownMax   time.Duration
 	Resume              bool
+	SessionPath         string
 	URLRefreshes        int
 	Progress            func(string)
 }
@@ -79,10 +80,12 @@ type downloadCommandSummary struct {
 	RemotePath       string
 	LocalPath        string
 	Strategy         string
+	SessionPath      string
 	Interfaces       []string
 	FileCount        int
 	SucceededCount   int
 	FailedCount      int
+	ResumedCount     int
 	TotalBytes       int64
 	TransferredBytes int64
 	Failures         []downloadCommandFailure
@@ -108,8 +111,9 @@ type downloadPathSelection struct {
 }
 
 type preparedDownloadJob struct {
-	Job        transfer.FileTransferJob
-	RemotePath string
+	Job          transfer.FileTransferJob
+	RemotePath   string
+	RelativePath string
 }
 
 func executeDownloadCommand(
@@ -135,6 +139,9 @@ func executeDownloadCommand(
 	if err != nil {
 		return summary, fmt.Errorf("%w: %v", errDownloadRemoteNotFound, err)
 	}
+	if !isDirectory && strings.TrimSpace(options.SessionPath) != "" {
+		return summary, fmt.Errorf("%w: --session is only used for recursive directory downloads", errDownloadUsage)
+	}
 	tree, err := collectRemoteDownloadTree(client, remoteID, remotePath, isDirectory, options.Recursive)
 	if err != nil {
 		return summary, err
@@ -147,11 +154,34 @@ func executeDownloadCommand(
 		summary.LocalPath = localTarget
 	}
 	summary.FileCount = len(tree.Files)
+
+	var treeSession *transfer.TransferTreeSession
+	if isDirectory && options.Resume {
+		var pending []remoteDownloadFile
+		var resumed int
+		var total int64
+		treeSession, pending, resumed, total, err = prepareRecursiveDownloadSession(remotePath, localTarget, tree, options.Strategy, options.SessionPath)
+		if err != nil {
+			return summary, err
+		}
+		summary.SessionPath = treeSession.Path()
+		summary.ResumedCount = resumed
+		summary.SucceededCount = resumed
+		summary.TotalBytes = total
+		tree.Files = pending
+		progress(options, fmt.Sprintf("Resumable directory session: %s (%d already complete, %d pending)", summary.SessionPath, resumed, len(pending)))
+	}
 	if len(tree.Files) == 0 {
-		summary.SucceededCount = 0
+		summary.FailedCount = summary.FileCount - summary.SucceededCount
+		if treeSession != nil && summary.FailedCount == 0 {
+			if err := treeSession.Remove(); err != nil {
+				return summary, err
+			}
+			summary.SessionPath = ""
+		}
 		return summary, nil
 	}
-	progress(options, fmt.Sprintf("Preparing %d file(s) for %s transfer...", len(tree.Files), options.Strategy))
+	progress(options, fmt.Sprintf("Preparing %d pending file(s) for %s transfer...", len(tree.Files), options.Strategy))
 
 	selection, err := resolveDownloadPathSelection(ctx, options.Interfaces, deps)
 	if err != nil {
@@ -177,19 +207,23 @@ func executeDownloadCommand(
 	if err != nil {
 		return summary, err
 	}
-	prepared, totalBytes, err := prepareDownloadJobs(ctx, client, tree.Files, isDirectory, localTarget, options.Strategy, options.Timeout, options.Resume, options.URLRefreshes, selection.Candidates, cache, deps)
+	prepared, pendingBytes, err := prepareDownloadJobs(ctx, client, tree.Files, isDirectory, localTarget, options.Strategy, options.Timeout, options.Resume, options.URLRefreshes, selection.Candidates, cache, deps)
 	if err != nil {
 		return summary, err
 	}
-	summary.TotalBytes = totalBytes
+	if treeSession == nil {
+		summary.TotalBytes = pendingBytes
+	}
 
 	jobs := make([]transfer.FileTransferJob, len(prepared))
 	remoteByJobID := make(map[string]string, len(prepared))
+	relativeByJobID := make(map[string]string, len(prepared))
 	for i, item := range prepared {
 		jobs[i] = item.Job
 		remoteByJobID[item.Job.ID] = item.RemotePath
+		relativeByJobID[item.Job.ID] = item.RelativePath
 	}
-	progress(options, fmt.Sprintf("Downloading %d file(s)...", len(jobs)))
+	progress(options, fmt.Sprintf("Downloading %d pending file(s)...", len(jobs)))
 	if strings.EqualFold(options.Strategy, "chunk") {
 		for _, item := range prepared {
 			job := item.Job
@@ -210,41 +244,69 @@ func executeDownloadCommand(
 			})
 			summary.ChunkResults = append(summary.ChunkResults, chunkResult)
 			if chunkErr != nil {
+				if persistErr := markDownloadSessionPending(treeSession, item.RelativePath, chunkErr); persistErr != nil {
+					return summary, errors.Join(chunkErr, persistErr)
+				}
 				summary.Failures = append(summary.Failures, downloadCommandFailure{RemotePath: item.RemotePath, Err: chunkErr})
 				continue
+			}
+			if err := markDownloadSessionCompleted(treeSession, item.RelativePath, job.DestinationPath, job.ExpectedSize); err != nil {
+				return summary, err
 			}
 			summary.SucceededCount++
 			summary.TransferredBytes += chunkResult.BytesWritten
 		}
-		summary.FailedCount = len(prepared) - summary.SucceededCount
-		if len(prepared) == 1 && summary.SucceededCount == 1 {
+		summary.FailedCount = summary.FileCount - summary.SucceededCount
+		if !isDirectory && len(prepared) == 1 && summary.SucceededCount == 1 {
 			summary.LocalPath = prepared[0].Job.DestinationPath
 		}
 		if summary.FailedCount > 0 {
-			return summary, fmt.Errorf("%d of %d chunk downloads failed", summary.FailedCount, len(prepared))
+			return summary, fmt.Errorf("%d of %d chunk downloads failed", summary.FailedCount, summary.FileCount)
+		}
+		if treeSession != nil {
+			if err := treeSession.Remove(); err != nil {
+				return summary, err
+			}
+			summary.SessionPath = ""
 		}
 		return summary, nil
 	}
 
-	report, scheduleErr := deps.scheduleFiles(ctx, selection.Workers, jobs,
+	schedulerOptions := []transfer.FileSchedulerOption{
 		transfer.WithFileScheduleRetries(options.Retries),
 		transfer.WithFileScheduleHealthTracker(health),
-	)
+	}
+	if treeSession != nil {
+		schedulerOptions = append(schedulerOptions, transfer.WithFileScheduleSuccessHook(func(result transfer.FileScheduleResult) error {
+			relative := relativeByJobID[result.JobID]
+			return markDownloadSessionCompleted(treeSession, relative, result.DestinationPath, result.ExpectedSize)
+		}))
+	}
+	report, scheduleErr := deps.scheduleFiles(ctx, selection.Workers, jobs, schedulerOptions...)
 	summary.Report = report
-	summary.SucceededCount = report.SucceededCount()
-	summary.FailedCount = report.FailedCount()
+	summary.SucceededCount += report.SucceededCount()
+	summary.FailedCount = summary.FileCount - summary.SucceededCount
 	for _, result := range report.Results {
 		if result.Err != nil {
+			if persistErr := markDownloadSessionPending(treeSession, relativeByJobID[result.JobID], result.Err); persistErr != nil {
+				return summary, errors.Join(result.Err, persistErr)
+			}
 			summary.Failures = append(summary.Failures, downloadCommandFailure{RemotePath: remoteByJobID[result.JobID], Err: result.Err})
 			continue
 		}
 		summary.TransferredBytes += result.Result.BytesWritten
 	}
-	if len(prepared) == 1 && summary.SucceededCount == 1 {
+	if !isDirectory && len(prepared) == 1 && summary.SucceededCount == 1 {
 		summary.LocalPath = prepared[0].Job.DestinationPath
 	}
 	if scheduleErr != nil {
 		return summary, scheduleErr
+	}
+	if summary.FailedCount == 0 && treeSession != nil {
+		if err := treeSession.Remove(); err != nil {
+			return summary, err
+		}
+		summary.SessionPath = ""
 	}
 	return summary, nil
 }
@@ -277,6 +339,9 @@ func validateDownloadCommandOptions(options downloadCommandOptions) error {
 	}
 	if options.HealthCooldownMax < options.HealthCooldown {
 		return errors.New("transfer health maximum cooldown must be >= cooldown")
+	}
+	if strings.TrimSpace(options.SessionPath) != "" && !options.Resume {
+		return errors.New("--session requires transfer.resume=true")
 	}
 	if options.URLRefreshes < 0 {
 		return errors.New("transfer URL refreshes must be >= 0")
@@ -502,6 +567,9 @@ func prepareDownloadJobs(
 			return nil, totalBytes, fmt.Errorf("download URL for %q is empty", source.RemotePath)
 		}
 		expectedSize := int64(info.FileSize)
+		if source.File.Size >= 0 && expectedSize != source.File.Size {
+			return nil, totalBytes, fmt.Errorf("remote file %q changed size from %d to %d while preparing download", source.RemotePath, source.File.Size, expectedSize)
+		}
 		if strings.EqualFold(strategy, "chunk") && expectedSize < 0 {
 			return nil, totalBytes, fmt.Errorf("prepare chunk download for %q: %w", source.RemotePath, transfer.ErrChunkRequiresKnownSize)
 		}
@@ -594,7 +662,8 @@ func prepareDownloadJobs(
 				Refresh:         refresh,
 				MaxRefreshes:    urlRefreshes,
 			},
-			RemotePath: source.RemotePath,
+			RemotePath:   source.RemotePath,
+			RelativePath: source.RelativePath,
 		})
 		if expectedSize > 0 {
 			totalBytes += expectedSize

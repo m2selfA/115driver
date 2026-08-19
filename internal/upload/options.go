@@ -23,6 +23,7 @@ type Options struct {
 	Timeout       time.Duration
 	HealthTracker *transfer.NetworkHealthTracker
 	Progress      func(string)
+	ResumePath    string
 }
 
 func DefaultOptions() Options {

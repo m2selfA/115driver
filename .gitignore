@@ -27,6 +27,10 @@ coverage/
 /.p[0-9]-*
 /.p[0-9][0-9]-*
 
+# Persistent transfer-session state (created beside user transfer roots)
+*.115driver-*.session.json
+*.115driver-*.parts/
+
 # Editor and OS metadata
 .vscode/
 .idea/
