@@ -1,108 +1,118 @@
 package cmd
 
 import (
+	"errors"
 	"fmt"
-	"io"
-	"net/http"
 	"os"
-	"path/filepath"
+	"strings"
 	"time"
 
+	"github.com/SheltonZhu/115driver/cli/internal/auth"
 	"github.com/SheltonZhu/115driver/cli/internal/output"
 	"github.com/SheltonZhu/115driver/cli/internal/resolver"
-	"github.com/SheltonZhu/115driver/pkg/driver"
+	transferpkg "github.com/SheltonZhu/115driver/internal/transfer"
 	"github.com/spf13/cobra"
 )
 
 const defaultDownloadTimeout = 2 * time.Hour
 
-var downloadTimeout = defaultDownloadTimeout
+var (
+	downloadTimeout    = defaultDownloadTimeout
+	downloadRecursive  bool
+	downloadInterfaces string
+	downloadStrategy   string
+	downloadChunkSize  string
+)
 
 var downloadCmd = &cobra.Command{
 	Use:   "download <remote_path> <local_path>",
-	Short: "Download a file from remote to a local directory or file path",
+	Short: "Download a file or recursively download a directory",
+	Long:  "Download through the configured transfer strategy. 'file' assigns whole files across interfaces; 'chunk' splits each file into HTTP byte ranges and aggregates all Range-capable interfaces. For directories, use --recursive; directory contents are written below local_path.",
 	Args:  cobra.ExactArgs(2),
 	RunE: func(cmd *cobra.Command, args []string) error {
-		remotePath := args[0]
-		localTarget := args[1]
 		if err := validateDownloadTimeout(downloadTimeout); err != nil {
 			return &exitError{code: output.ExitArgs, msg: err.Error()}
 		}
-
-		fileID, _, err := resolver.ResolvePath(client, remotePath)
+		transferConfig, err := auth.ResolveTransferConfig(configPath)
 		if err != nil {
-			return &exitError{code: output.ExitNotFound, msg: err.Error()}
+			return &exitError{code: output.ExitArgs, msg: err.Error()}
 		}
-
-		fileInfo, err := client.GetFile(fileID)
+		if strings.TrimSpace(downloadInterfaces) != "" {
+			transferConfig.Interfaces = strings.TrimSpace(downloadInterfaces)
+		}
+		if strings.TrimSpace(downloadStrategy) != "" {
+			transferConfig.Strategy = strings.ToLower(strings.TrimSpace(downloadStrategy))
+		}
+		chunkSizeText := transferConfig.ChunkSize
+		if strings.TrimSpace(downloadChunkSize) != "" {
+			chunkSizeText = strings.TrimSpace(downloadChunkSize)
+		}
+		chunkSize, err := transferpkg.ParseByteSize(chunkSizeText)
 		if err != nil {
-			return &exitError{code: output.ExitError, msg: err.Error()}
-		}
-		if fileInfo.IsDirectory {
-			return &exitError{code: output.ExitArgs, msg: "Cannot download a directory."}
+			return &exitError{code: output.ExitArgs, msg: fmt.Sprintf("invalid transfer chunk size %q: %v", chunkSizeText, err)}
 		}
 
-		dlInfo, err := client.Download(fileInfo.PickCode)
-		if err != nil {
-			return &exitError{code: output.ExitError, msg: fmt.Sprintf("Failed to get download URL: %v", err)}
+		options := downloadCommandOptions{
+			Recursive:           downloadRecursive,
+			Timeout:             downloadTimeout,
+			Interfaces:          transferConfig.Interfaces,
+			Strategy:            transferConfig.Strategy,
+			WorkersPerInterface: transferConfig.WorkersPerInterface,
+			ProbeCacheTTL:       transferConfig.ProbeCacheTTL,
+			Retries:             transferConfig.Retries,
+			ChunkSize:           chunkSize,
+			HealthCooldown:      transferConfig.HealthCooldown,
+			HealthCooldownMax:   transferConfig.HealthCooldownMax,
+			Resume:              transferConfig.Resume,
+			URLRefreshes:        transferConfig.URLRefreshes,
 		}
-
-		localPath := resolver.ResolveLocalDownloadPath(localTarget, dlInfo.FileName)
-
 		if !jsonOutput {
-			fmt.Printf("Downloading %s (%s)...\n", dlInfo.FileName, output.FormatFileSize(int64(dlInfo.FileSize)))
+			options.Progress = func(message string) {
+				fmt.Fprintln(os.Stderr, message)
+			}
 		}
 
-		if err := downloadFile(dlInfo, localPath); err != nil {
-			return &exitError{code: output.ExitError, msg: fmt.Sprintf("Download failed: %v", err)}
+		summary, err := executeDownloadCommand(cmd.Context(), client, args[0], args[1], options, defaultDownloadPipelineDeps())
+		if err != nil {
+			exitCode := output.ExitError
+			message := fmt.Sprintf("Download failed: %v", err)
+			switch {
+			case errors.Is(err, errDownloadRemoteNotFound):
+				exitCode = output.ExitNotFound
+				message = err.Error()
+			case errors.Is(err, errDownloadUsage):
+				exitCode = output.ExitArgs
+				message = err.Error()
+			}
+			if len(summary.Failures) > 0 {
+				first := summary.Failures[0]
+				message = fmt.Sprintf("%s; first failed file %s: %v", message, first.RemotePath, first.Err)
+			}
+			return &exitError{code: exitCode, msg: message}
 		}
 
 		printer.PrintSuccess(map[string]interface{}{
-			"remote_path": remotePath,
-			"local_path":  localPath,
-			"size":        int64(dlInfo.FileSize),
+			"remote_path": summary.RemotePath,
+			"local_path":  summary.LocalPath,
+			"strategy":    summary.Strategy,
+			"interfaces":  summary.Interfaces,
+			"files":       summary.FileCount,
+			"succeeded":   summary.SucceededCount,
+			"size":        summary.TotalBytes,
 		})
 		if !jsonOutput {
-			fmt.Printf("Download complete: %s\n", localPath)
+			if summary.FileCount <= 1 {
+				fmt.Printf("Download complete: %s\n", summary.LocalPath)
+			} else {
+				fmt.Printf("Download complete: %d files (%s) -> %s\n", summary.SucceededCount, output.FormatFileSize(summary.TransferredBytes), summary.LocalPath)
+			}
 		}
 		return nil
 	},
 }
 
-func downloadFile(dlInfo *driver.DownloadInfo, localPath string) error {
-	if err := os.MkdirAll(filepath.Dir(localPath), 0755); err != nil {
-		return err
-	}
-
-	req, err := http.NewRequest("GET", dlInfo.Url.Url, nil)
-	if err != nil {
-		return fmt.Errorf("create request: %w", err)
-	}
-	for k, vals := range dlInfo.Header {
-		for _, v := range vals {
-			req.Header.Add(k, v)
-		}
-	}
-
-	resp, err := newDownloadHTTPClient(downloadTimeout).Do(req)
-	if err != nil {
-		return fmt.Errorf("download request: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("download failed: HTTP %d", resp.StatusCode)
-	}
-
-	return saveDownloadResponse(localPath, resp, 0)
-}
-
 func resolveDownloadTargetPath(localTarget, fileName string) string {
 	return resolver.ResolveLocalDownloadPath(localTarget, fileName)
-}
-
-func newDownloadHTTPClient(timeout time.Duration) *http.Client {
-	return &http.Client{Timeout: timeout}
 }
 
 func validateDownloadTimeout(timeout time.Duration) error {
@@ -112,40 +122,11 @@ func validateDownloadTimeout(timeout time.Duration) error {
 	return nil
 }
 
-func saveDownloadResponse(localPath string, resp *http.Response, maxBytes int64) error {
-	if err := os.MkdirAll(filepath.Dir(localPath), 0755); err != nil {
-		return err
-	}
-	tmp, err := os.CreateTemp(filepath.Dir(localPath), "."+filepath.Base(localPath)+".*")
-	if err != nil {
-		return err
-	}
-	tmpPath := tmp.Name()
-	defer os.Remove(tmpPath)
-
-	var copyErr error
-	if maxBytes > 0 {
-		limited := &io.LimitedReader{R: resp.Body, N: maxBytes + 1}
-		written, err := io.Copy(tmp, limited)
-		if err != nil {
-			copyErr = err
-		} else if written > maxBytes || limited.N == 0 {
-			copyErr = fmt.Errorf("download exceeds limit of %d bytes", maxBytes)
-		}
-	} else {
-		_, copyErr = io.Copy(tmp, resp.Body)
-	}
-	if copyErr != nil {
-		tmp.Close()
-		return copyErr
-	}
-	if err := tmp.Close(); err != nil {
-		return err
-	}
-	return os.Rename(tmpPath, localPath)
-}
-
 func init() {
-	downloadCmd.Flags().DurationVar(&downloadTimeout, "timeout", defaultDownloadTimeout, "Download timeout, use 0 to disable")
+	downloadCmd.Flags().DurationVar(&downloadTimeout, "timeout", defaultDownloadTimeout, "Download timeout per file, use 0 to disable")
+	downloadCmd.Flags().BoolVarP(&downloadRecursive, "recursive", "r", false, "Recursively download a directory into local_path")
+	downloadCmd.Flags().StringVar(&downloadInterfaces, "interfaces", "", "Override transfer interfaces (auto, or comma-separated interface names/indexes/IPs)")
+	downloadCmd.Flags().StringVar(&downloadStrategy, "strategy", "", "Override transfer strategy (file or chunk)")
+	downloadCmd.Flags().StringVar(&downloadChunkSize, "chunk-size", "", "Override chunk strategy range size (for example 32MiB)")
 	rootCmd.AddCommand(downloadCmd)
 }

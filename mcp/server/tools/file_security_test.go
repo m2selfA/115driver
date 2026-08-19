@@ -162,25 +162,6 @@ func TestCopyHTTPResponseRejectsNegativeSizeLimit(t *testing.T) {
 	}
 }
 
-func TestSaveHTTPResponseToFileRejectsNegativeSizeLimit(t *testing.T) {
-	target := filepath.Join(t.TempDir(), "target.txt")
-	resp := &http.Response{
-		StatusCode: http.StatusOK,
-		Body:       io.NopCloser(strings.NewReader("abcdef")),
-	}
-
-	err := saveHTTPResponseToFile(target, resp, -1)
-	if err == nil {
-		t.Fatal("expected negative size limit to fail")
-	}
-	if !errors.Is(err, errInvalidSizeLimit) {
-		t.Fatalf("expected errInvalidSizeLimit, got %v", err)
-	}
-	if _, statErr := os.Stat(target); !os.IsNotExist(statErr) {
-		t.Fatalf("expected target not to be created, stat err: %v", statErr)
-	}
-}
-
 func TestMCPDefaultDownloadSizeAllowsLargeDownloads(t *testing.T) {
 	if defaultMCPDownloadMaxBytes != 0 {
 		t.Fatalf("expected default MCP download size to be unlimited, got %d", defaultMCPDownloadMaxBytes)
@@ -193,15 +174,15 @@ func TestMCPDefaultURLUploadSizeRemainsBounded(t *testing.T) {
 	}
 }
 
-func TestMCPHTTPClientUsesConfiguredTimeout(t *testing.T) {
-	client := newMCPHTTPClient(90 * time.Second)
+func TestMCPURLUploadHTTPClientUsesConfiguredTimeout(t *testing.T) {
+	client := newMCPURLUploadHTTPClient(90 * time.Second)
 	if client.Timeout != 90*time.Second {
 		t.Fatalf("expected configured timeout, got %s", client.Timeout)
 	}
 }
 
-func TestMCPHTTPClientRejectsUnsafeRedirect(t *testing.T) {
-	client := newMCPHTTPClient(90 * time.Second)
+func TestMCPURLUploadHTTPClientRejectsUnsafeRedirect(t *testing.T) {
+	client := newMCPURLUploadHTTPClient(90 * time.Second)
 	req := &http.Request{URL: mustParseURL(t, "http://127.0.0.1/private")}
 	if err := client.CheckRedirect(req, nil); err == nil {
 		t.Fatal("expected redirect to unsafe host to be rejected")
@@ -240,28 +221,6 @@ func TestDialResolvedIPsFallsBackToLaterAddresses(t *testing.T) {
 	}
 	if strings.Join(attempted, ",") != strings.Join(want, ",") {
 		t.Fatalf("unexpected dial attempts: got %v want %v", attempted, want)
-	}
-}
-
-func TestSaveHTTPResponseToFilePreservesExistingFileOnFailure(t *testing.T) {
-	target := filepath.Join(t.TempDir(), "target.txt")
-	if err := os.WriteFile(target, []byte("old"), 0600); err != nil {
-		t.Fatal(err)
-	}
-	resp := &http.Response{
-		StatusCode: http.StatusOK,
-		Body:       io.NopCloser(strings.NewReader("abcdef")),
-	}
-
-	if err := saveHTTPResponseToFile(target, resp, 3); err == nil {
-		t.Fatal("expected oversized response to fail")
-	}
-	got, err := os.ReadFile(target)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if string(got) != "old" {
-		t.Fatalf("expected existing file to be preserved, got %q", string(got))
 	}
 }
 

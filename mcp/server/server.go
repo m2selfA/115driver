@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"time"
 
@@ -19,6 +20,7 @@ type Server struct {
 	downloadTimeout   time.Duration
 	urlUploadMaxBytes int64
 	downloadMaxBytes  int64
+	downloadTransfer  tools.DownloadTransferConfig
 	allowDestructive  bool
 }
 
@@ -28,6 +30,7 @@ func NewServer() *Server {
 		downloadTimeout:   2 * time.Hour,
 		urlUploadMaxBytes: 2 << 30,
 		downloadMaxBytes:  0,
+		downloadTransfer:  tools.DefaultDownloadTransferConfig(),
 		mcpServer: mcp.NewServer(&mcp.Implementation{
 			Name:    "115driver-mcp-server",
 			Version: "1.0.0",
@@ -66,6 +69,12 @@ func (s *Server) WithTransferSizeLimits(urlUploadMaxBytes, downloadMaxBytes int6
 	return s
 }
 
+// WithDownloadTransferConfig configures the multi-interface 115 CDN download path.
+func (s *Server) WithDownloadTransferConfig(config tools.DownloadTransferConfig) *Server {
+	s.downloadTransfer = config
+	return s
+}
+
 // WithDestructiveTools controls MCP tools that mutate 115 cloud state.
 func (s *Server) WithDestructiveTools(allow bool) *Server {
 	s.allowDestructive = allow
@@ -74,6 +83,9 @@ func (s *Server) WithDestructiveTools(allow bool) *Server {
 
 // Start runs the MCP server
 func (s *Server) Start(ctx context.Context) error {
+	if err := s.downloadTransfer.Validate(); err != nil {
+		return fmt.Errorf("invalid MCP download transfer configuration: %w", err)
+	}
 	// Register all tools
 	s.registerTools()
 
@@ -102,6 +114,7 @@ func (s *Server) registerTools() {
 		tools.WithDownloadTimeout(s.downloadTimeout),
 		tools.WithURLUploadMaxBytes(s.urlUploadMaxBytes),
 		tools.WithDownloadMaxBytes(s.downloadMaxBytes),
+		tools.WithDownloadTransferConfig(s.downloadTransfer),
 		tools.WithDestructiveTools(s.allowDestructive),
 	)
 	fileTools.RegisterTools(s.mcpServer)

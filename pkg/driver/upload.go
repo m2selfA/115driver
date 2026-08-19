@@ -152,6 +152,13 @@ func (c *Pan115Client) UploadByOSS(params *UploadOSSParams, r io.Reader, dirID s
 	return c.checkUploadStatus(dirID, params.SHA1)
 }
 
+// CheckUploadStatus verifies that an uploaded object with the expected SHA1 is
+// visible in the target directory. It is the exported counterpart of the
+// legacy ordinary OSS upload verification step.
+func (c *Pan115Client) CheckUploadStatus(dirID, sha1 string) error {
+	return c.checkUploadStatus(dirID, sha1)
+}
+
 func (c *Pan115Client) checkUploadStatus(dirID, sha1 string) error {
 	// 验证上传是否成功
 	req := c.NewRequest().ForceContentType("application/json;charset=UTF-8")

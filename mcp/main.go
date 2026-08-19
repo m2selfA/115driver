@@ -23,7 +23,7 @@ var (
 	profile   = flag.String("profile", "", "Config profile name (default 'main')")
 	configDir = flag.String("config", "", "Config file path (default ~/.115driver/config.toml)")
 
-	localRoot = flag.String("local-root", "", "allow MCP local file tools to read/write only under this directory")
+	localRoot         = flag.String("local-root", "", "allow MCP local file tools to read/write only under this directory")
 	urlUploadMaxBytes = flag.Int64(
 		"url-upload-max-bytes",
 		2<<30,
@@ -96,6 +96,10 @@ func main() {
 
 	// Read config values
 	defaultSaveDir := readConfigValue(*configDir, *profile, "default_offline_save_dir")
+	transferConfig, err := readDownloadTransferConfig(*configDir)
+	if err != nil {
+		log.Fatalf("Invalid transfer config: %v", err)
+	}
 
 	// Create and start the MCP server
 	s := server.NewServer().
@@ -104,6 +108,7 @@ func main() {
 		WithLocalRoot(*localRoot).
 		WithDownloadTimeout(*downloadTimeout).
 		WithTransferSizeLimits(*urlUploadMaxBytes, *downloadMaxBytes).
+		WithDownloadTransferConfig(transferConfig).
 		WithDestructiveTools(*allowDestructive)
 	if err := s.Start(context.Background()); err != nil {
 		log.Fatalf("Server failed: %v", err)

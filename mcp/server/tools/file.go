@@ -25,6 +25,8 @@ type FileTools struct {
 	urlUploadMaxBytes int64
 	downloadMaxBytes  int64
 	allowDestructive  bool
+	downloadTransfer  *mcpDownloadTransferState
+	uploadTransfer    *mcpUploadTransferState
 }
 
 type FileToolsOption func(*FileTools)
@@ -66,6 +68,8 @@ func NewFileTools(client *driver.Pan115Client, opts ...FileToolsOption) *FileToo
 		downloadTimeout:   defaultMCPDownloadTimeout,
 		urlUploadMaxBytes: defaultMCPURLUploadMaxBytes,
 		downloadMaxBytes:  defaultMCPDownloadMaxBytes,
+		downloadTransfer:  newMCPDownloadTransferState(),
+		uploadTransfer:    newMCPUploadTransferState(),
 	}
 	for _, opt := range opts {
 		opt(ft)
@@ -431,7 +435,7 @@ func (ft *FileTools) uploadFromURL(ctx context.Context, req *mcp.CallToolRequest
 	if err != nil {
 		return toolError(fmt.Sprintf("Failed to create download request: %v", err)), nil, nil
 	}
-	resp, err := newMCPHTTPClient(ft.downloadTimeout).Do(httpReq)
+	resp, err := newMCPURLUploadHTTPClient(ft.downloadTimeout).Do(httpReq)
 	if err != nil {
 		return &mcp.CallToolResult{
 			Content: []mcp.Content{
@@ -508,8 +512,9 @@ func (ft *FileTools) uploadFromURL(ctx context.Context, req *mcp.CallToolRequest
 		}, nil, nil
 	}
 
-	// Upload the downloaded content to 115 using the existing method
-	err = ft.client.RapidUploadOrByOSS(args.DirID, fileName, fileSize, tempFile)
+	// The external URL has already been fetched through the SSRF-restricted
+	// client above. Only this local tempfile -> trusted 115 OSS stage uses P10.
+	_, err = ft.uploadThroughTransfer(ctx, args.DirID, fileName, fileSize, tempFile)
 	if err != nil {
 		return &mcp.CallToolResult{
 			Content: []mcp.Content{
@@ -601,8 +606,8 @@ func (ft *FileTools) uploadFromLocal(ctx context.Context, req *mcp.CallToolReque
 		}, nil, nil
 	}
 
-	// Upload the file using the existing method
-	err = ft.client.RapidUploadOrByOSS(args.DirID, fileName, fileSize, file)
+	// Local file data may use the P10 multi-interface OSS path.
+	_, err = ft.uploadThroughTransfer(ctx, args.DirID, fileName, fileSize, file)
 	if err != nil {
 		return &mcp.CallToolResult{
 			Content: []mcp.Content{
@@ -644,8 +649,14 @@ func (ft *FileTools) downloadFile(ctx context.Context, req *mcp.CallToolRequest,
 	if err != nil {
 		return toolError(fmt.Sprintf("Local file access denied: %v", err)), nil, nil
 	}
+	if ft.downloadTransfer == nil {
+		ft.downloadTransfer = newMCPDownloadTransferState()
+	}
+	if err := ft.downloadTransfer.config.Validate(); err != nil {
+		return toolError(fmt.Sprintf("Invalid transfer configuration: %v", err)), nil, nil
+	}
 
-	// Get download info with the specified User-Agent
+	// The signed CDN URL and headers come only from the authenticated 115 API.
 	downloadInfo, err := ft.client.DownloadWithUA(args.PickCode, args.UserAgent)
 	if err != nil {
 		return &mcp.CallToolResult{
@@ -658,39 +669,8 @@ func (ft *FileTools) downloadFile(ctx context.Context, req *mcp.CallToolRequest,
 		}, nil, nil
 	}
 
-	// Perform the actual download using the same User-Agent
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, downloadInfo.Url.Url, nil)
-	if err != nil {
-		return toolError(fmt.Sprintf("Failed to create download request: %v", err)), nil, nil
-	}
-	for k, vals := range downloadInfo.Header {
-		for _, v := range vals {
-			httpReq.Header.Add(k, v)
-		}
-	}
-
-	resp, err := newMCPHTTPClient(ft.downloadTimeout).Do(httpReq)
-	if err != nil {
-		return &mcp.CallToolResult{
-			Content: []mcp.Content{
-				&mcp.TextContent{
-					Text: fmt.Sprintf("Failed to download file: %v", err),
-				},
-			},
-			IsError: true,
-		}, nil, nil
-	}
-	defer resp.Body.Close()
-
-	if err := saveHTTPResponseToFile(localPath, resp, ft.downloadMaxBytes); err != nil {
-		return &mcp.CallToolResult{
-			Content: []mcp.Content{
-				&mcp.TextContent{
-					Text: fmt.Sprintf("Failed to save file locally: %v", err),
-				},
-			},
-			IsError: true,
-		}, nil, nil
+	if _, err := ft.downloadThroughTransfer(ctx, downloadInfo, localPath, args.PickCode, args.UserAgent); err != nil {
+		return toolError(fmt.Sprintf("Failed to download file: %v", err)), nil, nil
 	}
 
 	result := DownloadFileResult{
@@ -906,7 +886,9 @@ func copyHTTPResponse(dst io.Writer, resp *http.Response, maxBytes int64) error 
 	return nil
 }
 
-func newMCPHTTPClient(timeout time.Duration) *http.Client {
+// newMCPURLUploadHTTPClient is only for untrusted upload_from_url sources. It
+// validates redirects and resolved IPs to preserve the MCP SSRF boundary.
+func newMCPURLUploadHTTPClient(timeout time.Duration) *http.Client {
 	dialer := &net.Dialer{Timeout: 30 * time.Second}
 	return &http.Client{
 		Timeout: timeout,
@@ -931,30 +913,6 @@ func newMCPHTTPClient(timeout time.Duration) *http.Client {
 			},
 		},
 	}
-}
-
-func saveHTTPResponseToFile(path string, resp *http.Response, maxBytes int64) error {
-	if maxBytes < 0 {
-		return fmt.Errorf("%w: %d", errInvalidSizeLimit, maxBytes)
-	}
-	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
-		return err
-	}
-	tmp, err := os.CreateTemp(filepath.Dir(path), "."+filepath.Base(path)+".*")
-	if err != nil {
-		return err
-	}
-	tmpPath := tmp.Name()
-	defer os.Remove(tmpPath)
-
-	if err := copyHTTPResponse(tmp, resp, maxBytes); err != nil {
-		tmp.Close()
-		return err
-	}
-	if err := tmp.Close(); err != nil {
-		return err
-	}
-	return os.Rename(tmpPath, path)
 }
 
 func toolError(text string) *mcp.CallToolResult {
