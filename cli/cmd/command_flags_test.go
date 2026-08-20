@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/spf13/cobra"
@@ -26,6 +27,19 @@ func TestRecursiveAndSessionFlagsHaveShortForms(t *testing.T) {
 				t.Fatalf("flag --%s shorthand: got %q want %q", test.flagName, got, test.shorthand)
 			}
 		})
+	}
+}
+
+func TestUploadExposesContentsMode(t *testing.T) {
+	flag := uploadCmd.Flags().Lookup("contents")
+	if flag == nil {
+		t.Fatal("upload command is missing --contents")
+	}
+	if flag.Shorthand != "" {
+		t.Fatalf("upload --contents unexpectedly has shorthand %q", flag.Shorthand)
+	}
+	if !strings.Contains(uploadCmd.Long, "copied by name") || !strings.Contains(uploadCmd.Example, "--contents") {
+		t.Fatalf("upload help does not explain recursive directory semantics: long=%q example=%q", uploadCmd.Long, uploadCmd.Example)
 	}
 }
 

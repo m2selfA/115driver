@@ -6,7 +6,9 @@ import (
 	"fmt"
 	"io/fs"
 	"os"
+	pathpkg "path"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 
@@ -58,6 +60,9 @@ type uploadCommandSummary struct {
 	FileCount        int
 	SucceededCount   int
 	FailedCount      int
+	UploadedCount    int
+	VerifiedCount    int
+	SkippedCount     int
 	RapidCount       int
 	ResumedCount     int
 	TotalBytes       int64
@@ -70,6 +75,7 @@ func executeRecursiveUpload(
 	treeClient uploadTreeClient,
 	uploadClient *driver.Pan115Client,
 	localRoot, remoteDir, remoteRootID string,
+	contents bool,
 	resume bool,
 	sessionOverride string,
 	options uploadpkg.Options,
@@ -93,6 +99,12 @@ func executeRecursiveUpload(
 		return summary, err
 	}
 	summary.LocalPath = tree.Root
+	requestedRemoteDir := remoteDir
+	remoteDir, err = recursiveUploadDestinationPath(remoteDir, tree.Root, contents)
+	if err != nil {
+		return summary, err
+	}
+	summary.RemoteDir = remoteDir
 	summary.FileCount = len(tree.Files)
 	for _, file := range tree.Files {
 		summary.TotalBytes += file.Size
@@ -141,6 +153,17 @@ func executeRecursiveUpload(
 		}
 		summary.SessionPath = sessionPath
 		partsDir = derivedPartsDir
+	}
+
+	if !contents {
+		preparedRemoteDir, preparedRootID, err := prepareRecursiveUploadDestination(treeClient, requestedRemoteDir, remoteRootID, tree.Root, false)
+		if err != nil {
+			return summary, err
+		}
+		if preparedRemoteDir != remoteDir {
+			return summary, fmt.Errorf("recursive upload destination changed during preparation: %q != %q", preparedRemoteDir, remoteDir)
+		}
+		remoteRootID = preparedRootID
 	}
 
 	directoryIDs, listings, err := ensureRemoteUploadDirectories(treeClient, remoteRootID, tree.Directories, session)
@@ -297,6 +320,69 @@ func is115DriverTransferStateName(name string, isDir bool) bool {
 	return strings.Contains(name, ".session.json.")
 }
 
+func uploadSourceRequestsContents(localPath string) bool {
+	if strings.HasSuffix(localPath, "/") {
+		return true
+	}
+	return runtime.GOOS == "windows" && strings.HasSuffix(localPath, "\\")
+}
+
+func recursiveUploadDestinationPath(remoteDir, localRoot string, contents bool) (string, error) {
+	if contents {
+		return remoteDir, nil
+	}
+	absolute, err := filepath.Abs(localRoot)
+	if err != nil {
+		return "", fmt.Errorf("resolve recursive upload source: %w", err)
+	}
+	base := filepath.Base(filepath.Clean(absolute))
+	if base == "" || base == "." || base == string(filepath.Separator) || base == filepath.VolumeName(absolute) {
+		return "", fmt.Errorf("%w: recursive upload source %q has no directory name to preserve; use --contents", errUploadUsage, localRoot)
+	}
+	return pathpkg.Join(remoteDir, base), nil
+}
+
+func prepareRecursiveUploadDestination(client uploadTreeClient, remoteDir, rootID, localRoot string, contents bool) (string, string, error) {
+	destination, err := recursiveUploadDestinationPath(remoteDir, localRoot, contents)
+	if err != nil {
+		return "", "", err
+	}
+	if contents {
+		return destination, rootID, nil
+	}
+	if client == nil {
+		return "", "", errors.New("upload tree client is nil")
+	}
+	base := pathpkg.Base(destination)
+	entries, err := client.List(rootID)
+	if err != nil {
+		return "", "", fmt.Errorf("list recursive upload destination %q: %w", remoteDir, err)
+	}
+	if entries == nil {
+		return "", "", fmt.Errorf("list recursive upload destination %q returned nil", remoteDir)
+	}
+	childID := ""
+	for _, entry := range *entries {
+		if entry.Name != base {
+			continue
+		}
+		if !entry.IsDirectory {
+			return "", "", fmt.Errorf("remote file %q conflicts with recursive upload source directory", destination)
+		}
+		if childID != "" && childID != entry.FileID {
+			return "", "", fmt.Errorf("remote directory %q is ambiguous", destination)
+		}
+		childID = entry.FileID
+	}
+	if childID == "" {
+		childID, err = client.Mkdir(rootID, base)
+		if err != nil {
+			return "", "", fmt.Errorf("create recursive upload root %q: %w", destination, err)
+		}
+	}
+	return destination, childID, nil
+}
+
 func ensureRemoteUploadDirectories(client uploadTreeClient, rootID string, directories []string, session *transfer.TransferTreeSession) (map[string]string, map[string][]driver.File, error) {
 	ids := map[string]string{"": rootID}
 	listings := make(map[string][]driver.File, len(directories))
@@ -367,6 +453,43 @@ func ensureRemoteUploadDirectories(client uploadTreeClient, rootID string, direc
 		listings[relative] = append([]driver.File(nil), (*entries)...)
 	}
 	return ids, listings, nil
+}
+
+func uploadResumeStatePresent(path string) (bool, error) {
+	if strings.TrimSpace(path) == "" {
+		return false, nil
+	}
+	_, err := os.Lstat(path)
+	if err == nil {
+		return true, nil
+	}
+	if os.IsNotExist(err) {
+		return false, nil
+	}
+	return false, err
+}
+
+func remoteUploadHasComparableFile(entries []driver.File, name string, size int64) bool {
+	for _, entry := range entries {
+		if entry.IsDirectory || entry.Name != name || entry.Size != size {
+			continue
+		}
+		if strings.TrimSpace(entry.Sha1) != "" {
+			return true
+		}
+	}
+	return false
+}
+
+func prepareExistingUploadDigest(file *os.File, size int64, entries []driver.File, name string) (*uploadpkg.PreparedDigest, bool, error) {
+	if !remoteUploadHasComparableFile(entries, name, size) {
+		return nil, false, nil
+	}
+	digest, err := uploadpkg.PrepareFileDigest(file, size)
+	if err != nil {
+		return nil, false, err
+	}
+	return digest, remoteUploadFileExists(entries, name, size, digest.SHA1), nil
 }
 
 func remoteUploadFileExists(entries []driver.File, name string, size int64, sha1 string) bool {

@@ -3,6 +3,7 @@ package cmd
 import (
 	"fmt"
 	"os"
+	pathpkg "path"
 	"path/filepath"
 	"strings"
 	"time"
@@ -20,6 +21,7 @@ var (
 	uploadChunkSize           string
 	uploadTimeout             time.Duration
 	uploadRecursive           bool
+	uploadContents            bool
 	uploadSession             string
 	uploadWorkersPerInterface int
 )
@@ -59,10 +61,11 @@ func buildUploadOptions(config auth.TransferConfig, interfacesOverride, chunkSiz
 }
 
 var uploadCmd = &cobra.Command{
-	Use:   "upload <local_path> <remote_dir>",
-	Short: "Upload a file or recursively upload a directory",
-	Long:  "Upload with 115 rapid-upload first. If OSS data transfer is required, reachable interfaces are selected automatically. Recoverable network/finalization failures retry using transfer.retries. When the 115 callback requires OSS SHA1 context, or if 115 rejects multipart verification, upload automatically uses strict sequential OSS mode with interface failover for protocol compatibility. transfer.workers_per_interface controls independent connections per physical interface for ordinary multipart uploads and concurrent recursive files. Use --recursive for directories; resumable transfer sessions are enabled by transfer.resume.",
-	Args:  cobra.ExactArgs(2),
+	Use:     "upload <local_path> <remote_dir>",
+	Short:   "Upload a file or recursively upload a directory",
+	Long:    "Upload verifies an existing same-name, same-size remote file by SHA1 before starting rapid-upload/OSS and skips the upload when contents already match. The computed digest is reused if upload is still required. If OSS data transfer is required, reachable interfaces are selected automatically. Recoverable network/finalization failures retry using transfer.retries. When the 115 callback requires OSS SHA1 context, or if 115 rejects multipart verification, upload automatically uses strict sequential OSS mode with interface failover for protocol compatibility. transfer.workers_per_interface controls independent connections per physical interface for ordinary multipart uploads and concurrent recursive files. With --recursive, a source directory is copied by name into remote_dir by default. A trailing slash on local_path (or a trailing backslash on Windows), or --contents, uploads only the directory contents directly into remote_dir. Resumable transfer sessions are enabled by transfer.resume.",
+	Example: "  # Preserve the source directory name: /remote/dir/source/...\n  115driver upload -r ./source /remote/dir\n\n  # Upload only source contents: /remote/dir/...\n  115driver upload -r ./source/ /remote/dir\n  115driver upload -r --contents ./source /remote/dir",
+	Args:    cobra.ExactArgs(2),
 	RunE: func(cmd *cobra.Command, args []string) error {
 		localPath := args[0]
 		remoteDir := args[1]
@@ -100,9 +103,10 @@ var uploadCmd = &cobra.Command{
 		}
 		if stat.IsDir() {
 			if !uploadRecursive {
-				return &exitError{code: output.ExitArgs, msg: "Local path is a directory; use --recursive to upload its contents"}
+				return &exitError{code: output.ExitArgs, msg: "Local path is a directory; use --recursive to upload it"}
 			}
-			summary, err := executeRecursiveUpload(cmd.Context(), client, client, localPath, remoteDir, dirID, transferConfig.Resume, uploadSession, uploadOptions, defaultUploadPipelineDeps())
+			contentsMode := uploadContents || uploadSourceRequestsContents(localPath)
+			summary, err := executeRecursiveUpload(cmd.Context(), client, client, localPath, remoteDir, dirID, contentsMode, transferConfig.Resume, uploadSession, uploadOptions, defaultUploadPipelineDeps())
 			if err != nil {
 				message := fmt.Sprintf("Upload failed: %v", err)
 				if len(summary.Failures) > 0 {
@@ -112,14 +116,17 @@ var uploadCmd = &cobra.Command{
 			}
 			finishUploadProgress()
 			printer.PrintSuccess(map[string]interface{}{
-				"local_path": localPath, "remote_dir": remoteDir, "files": summary.FileCount,
-				"succeeded": summary.SucceededCount, "rapid": summary.RapidCount, "resumed": summary.ResumedCount,
-				"size": summary.TotalBytes,
+				"local_path": localPath, "remote_dir": remoteDir, "destination": summary.RemoteDir, "contents": contentsMode, "files": summary.FileCount,
+				"succeeded": summary.SucceededCount, "uploaded": summary.UploadedCount, "verified": summary.VerifiedCount, "skipped": summary.SkippedCount,
+				"rapid": summary.RapidCount, "resumed": summary.ResumedCount, "size": summary.TotalBytes, "transferred_bytes": summary.TransferredBytes,
 			})
 			if !jsonOutput {
-				fmt.Printf("Upload complete: %d files (%s) -> %s\n", summary.SucceededCount, output.FormatFileSize(summary.TotalBytes), remoteDir)
+				fmt.Printf("Upload complete: %d files (%s), %d uploaded, %d verified/skipped -> %s\n", summary.SucceededCount, output.FormatFileSize(summary.TotalBytes), summary.UploadedCount, summary.SkippedCount, summary.RemoteDir)
 			}
 			return nil
+		}
+		if uploadContents {
+			return &exitError{code: output.ExitArgs, msg: "--contents is only valid for recursive directory uploads"}
 		}
 		if !stat.Mode().IsRegular() {
 			return &exitError{code: output.ExitArgs, msg: "Local upload source must be a regular file"}
@@ -133,14 +140,52 @@ var uploadCmd = &cobra.Command{
 			}
 			uploadOptions.ResumePath = sessionPath
 		}
-		if !jsonOutput {
-			fmt.Printf("Uploading %s (%s)...\n", fileName, output.FormatFileSize(stat.Size()))
-		}
 		f, err := os.Open(localPath)
 		if err != nil {
 			return &exitError{code: output.ExitArgs, msg: fmt.Sprintf("Cannot open local file: %v", err)}
 		}
 		defer f.Close()
+		resumeStatePresent, err := uploadResumeStatePresent(uploadOptions.ResumePath)
+		if err != nil {
+			return &exitError{code: output.ExitError, msg: fmt.Sprintf("Cannot inspect upload resume state: %v", err)}
+		}
+		if !resumeStatePresent {
+			entries, err := client.List(dirID)
+			if err != nil {
+				return &exitError{code: output.ExitError, msg: fmt.Sprintf("Cannot inspect remote directory before upload: %v", err)}
+			}
+			if entries == nil {
+				return &exitError{code: output.ExitError, msg: "Cannot inspect remote directory before upload: empty listing response"}
+			}
+			if remoteUploadHasComparableFile(*entries, fileName, stat.Size()) {
+				if !jsonOutput {
+					fmt.Printf("Verifying existing %s by SHA1...\n", fileName)
+				}
+				digest, identical, err := prepareExistingUploadDigest(f, stat.Size(), *entries, fileName)
+				if err != nil {
+					return &exitError{code: output.ExitError, msg: fmt.Sprintf("Verify existing remote file failed: %v", err)}
+				}
+				uploadOptions.PreparedDigest = digest
+				if identical {
+					finishUploadProgress()
+					remotePath := pathpkg.Join(remoteDir, fileName)
+					if strings.HasPrefix(remoteDir, "/") && !strings.HasPrefix(remotePath, "/") {
+						remotePath = "/" + remotePath
+					}
+					printer.PrintSuccess(map[string]interface{}{
+						"local_path": localPath, "remote_dir": remoteDir, "destination": remotePath, "size": stat.Size(), "sha1": digest.SHA1,
+						"uploaded": false, "verified": true, "skipped": true, "rapid": false, "resumed": false,
+					})
+					if !jsonOutput {
+						fmt.Printf("Upload skipped: %s already matches %s\n", fileName, remotePath)
+					}
+					return nil
+				}
+			}
+		}
+		if !jsonOutput {
+			fmt.Printf("Uploading %s (%s)...\n", fileName, output.FormatFileSize(stat.Size()))
+		}
 		uploadResult, err := uploadpkg.UploadFile(cmd.Context(), client, dirID, fileName, stat.Size(), f, uploadOptions)
 		if err != nil {
 			return &exitError{code: output.ExitError, msg: fmt.Sprintf("Upload failed: %v", err)}
@@ -156,19 +201,25 @@ var uploadCmd = &cobra.Command{
 		}
 		finishUploadProgress()
 		printer.PrintSuccess(map[string]interface{}{
-			"local_path": localPath, "remote_dir": remoteDir, "size": stat.Size(), "rapid": uploadResult.Rapid,
+			"local_path": localPath, "remote_dir": remoteDir, "size": stat.Size(), "sha1": uploadResult.SHA1,
+			"uploaded": !uploadResult.Skipped, "verified": uploadResult.Verified, "skipped": uploadResult.Skipped, "rapid": uploadResult.Rapid,
 			"multipart": uploadResult.Multipart, "parts": uploadResult.PartCount, "resumed": uploadResult.Resumed,
 			"resumed_parts": uploadResult.ResumedParts, "interfaces": interfaces,
 		})
 		if !jsonOutput {
-			fmt.Printf("Upload complete: %s -> %s\n", fileName, remoteDir)
+			if uploadResult.Skipped {
+				fmt.Printf("Upload skipped: %s already matches %s\n", fileName, pathpkg.Join(remoteDir, fileName))
+			} else {
+				fmt.Printf("Upload complete: %s -> %s\n", fileName, remoteDir)
+			}
 		}
 		return nil
 	},
 }
 
 func init() {
-	uploadCmd.Flags().BoolVarP(&uploadRecursive, "recursive", "r", false, "Recursively upload a directory's contents while preserving hierarchy")
+	uploadCmd.Flags().BoolVarP(&uploadRecursive, "recursive", "r", false, "Recursively upload a directory; preserves the source directory name by default")
+	uploadCmd.Flags().BoolVar(&uploadContents, "contents", false, "Upload only a recursive source directory's contents directly into remote_dir")
 	uploadCmd.Flags().StringVarP(&uploadSession, "session", "s", "", "Override persistent upload session file path (requires transfer.resume=true)")
 	uploadCmd.Flags().StringVar(&uploadInterfaces, "interfaces", "", "Override upload interfaces (auto, or comma-separated interface names/indexes/IPs)")
 	uploadCmd.Flags().StringVar(&uploadChunkSize, "chunk-size", "", "Override OSS multipart part size (for example 32MiB)")

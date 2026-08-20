@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 
 	"github.com/SheltonZhu/115driver/internal/transfer"
@@ -59,6 +60,9 @@ type recursiveUploadFileResult struct {
 	Index            int
 	RelativePath     string
 	Success          bool
+	Uploaded         bool
+	Verified         bool
+	Skipped          bool
 	Rapid            bool
 	Resumed          bool
 	TransferredBytes int64
@@ -95,19 +99,7 @@ func (processor *recursiveUploadFileProcessor) process(ctx context.Context, sour
 		return outcome
 	}
 
-	if state, ok := processor.sessionFiles[source.RelativePath]; ok && state.Completed {
-		if remoteUploadFileExists(processor.listings[parentRelative], filepath.Base(source.RelativePath), source.Size, state.SHA1) {
-			processor.progress.set(source.RelativePath, source.Size, source.Size)
-			outcome.Success = true
-			outcome.Resumed = true
-			return outcome
-		}
-		if err := processor.session.MarkFilePending(source.RelativePath, errors.New("previously completed remote file is no longer present")); err != nil {
-			outcome.Fatal = err
-			return outcome
-		}
-	}
-
+	statusPrefix := fmt.Sprintf("[%d/%d] %s", fileIndex+1, processor.fileCount, source.RelativePath)
 	info, err := os.Lstat(source.FullPath)
 	if err != nil {
 		outcome.Err = err
@@ -126,17 +118,110 @@ func (processor *recursiveUploadFileProcessor) process(ctx context.Context, sour
 		}
 		return outcome
 	}
-	file, err := os.Open(source.FullPath)
-	if err != nil {
-		outcome.Err = err
-		processor.progress.set(source.RelativePath, 0, source.Size)
-		if processor.session != nil {
-			_ = processor.session.MarkFilePending(source.RelativePath, err)
+
+	entries := processor.listings[parentRelative]
+	fileName := filepath.Base(source.RelativePath)
+	state, hasSessionState := processor.sessionFiles[source.RelativePath]
+	resumePath := ""
+	resumeStatePresent := false
+	if processor.session != nil {
+		resumePath = uploadResumePathForRelative(processor.partsDir, source.RelativePath)
+		resumeStatePresent, err = uploadResumeStatePresent(resumePath)
+		if err != nil {
+			outcome.Err = fmt.Errorf("inspect upload resume state: %w", err)
+			return outcome
 		}
+	}
+	if !resumeStatePresent && hasSessionState && strings.TrimSpace(state.SHA1) != "" && remoteUploadFileExists(entries, fileName, source.Size, state.SHA1) {
+		if processor.session != nil && !state.Completed {
+			if err := processor.session.MarkFileCompleted(source.RelativePath); err != nil {
+				outcome.Fatal = err
+				return outcome
+			}
+		}
+		if processor.options.Progress != nil {
+			processor.options.Progress(statusPrefix + " — Existing remote file verified; skipping upload.")
+		}
+		processor.progress.set(source.RelativePath, source.Size, source.Size)
+		outcome.Success = true
+		outcome.Verified = true
+		outcome.Skipped = true
+		outcome.Resumed = true
 		return outcome
 	}
 
+	var file *os.File
+	var preparedDigest *uploadpkg.PreparedDigest
+	if !resumeStatePresent && remoteUploadHasComparableFile(entries, fileName, source.Size) {
+		file, err = os.Open(source.FullPath)
+		if err != nil {
+			outcome.Err = err
+			processor.progress.set(source.RelativePath, 0, source.Size)
+			return outcome
+		}
+		if processor.options.Progress != nil {
+			processor.options.Progress(statusPrefix + " — Verifying same-size remote file by SHA1...")
+		}
+		var identical bool
+		preparedDigest, identical, err = prepareExistingUploadDigest(file, source.Size, entries, fileName)
+		if err != nil {
+			_ = file.Close()
+			outcome.Err = err
+			processor.progress.set(source.RelativePath, 0, source.Size)
+			return outcome
+		}
+		if processor.session != nil {
+			if err := processor.session.SetFileSHA1(source.RelativePath, preparedDigest.SHA1); err != nil {
+				_ = file.Close()
+				outcome.Fatal = err
+				return outcome
+			}
+		}
+		if identical {
+			if err := file.Close(); err != nil {
+				outcome.Err = err
+				return outcome
+			}
+			if processor.session != nil {
+				if err := processor.session.MarkFileCompleted(source.RelativePath); err != nil {
+					outcome.Fatal = err
+					return outcome
+				}
+			}
+			if processor.options.Progress != nil {
+				processor.options.Progress(statusPrefix + " — Existing remote file verified; skipping upload.")
+			}
+			processor.progress.set(source.RelativePath, source.Size, source.Size)
+			outcome.Success = true
+			outcome.Verified = true
+			outcome.Skipped = true
+			outcome.Resumed = hasSessionState
+			return outcome
+		}
+	}
+	if !resumeStatePresent && hasSessionState && state.Completed && processor.session != nil {
+		if err := processor.session.MarkFilePending(source.RelativePath, errors.New("previously completed remote file is no longer present or no longer matches")); err != nil {
+			if file != nil {
+				_ = file.Close()
+			}
+			outcome.Fatal = err
+			return outcome
+		}
+	}
+	if file == nil {
+		file, err = os.Open(source.FullPath)
+		if err != nil {
+			outcome.Err = err
+			processor.progress.set(source.RelativePath, 0, source.Size)
+			if processor.session != nil {
+				_ = processor.session.MarkFilePending(source.RelativePath, err)
+			}
+			return outcome
+		}
+	}
+
 	fileOptions := processor.options
+	fileOptions.PreparedDigest = preparedDigest
 	if interfaceSelector != "" {
 		fileOptions.Interfaces = interfaceSelector
 		// A pinned recursive-file slot gets one path attempt. If that path
@@ -145,7 +230,6 @@ func (processor *recursiveUploadFileProcessor) process(ctx context.Context, sour
 		// for healthy-path recovery instead of waiting on the dead NIC.
 		fileOptions.Retries = 0
 	}
-	statusPrefix := fmt.Sprintf("[%d/%d] %s", fileIndex+1, processor.fileCount, source.RelativePath)
 	if processor.options.Progress != nil {
 		outerProgress := processor.options.Progress
 		outerProgress(statusPrefix)
@@ -158,10 +242,10 @@ func (processor *recursiveUploadFileProcessor) process(ctx context.Context, sour
 			processor.progress.set(source.RelativePath, completed, source.Size)
 		}
 	}
-	if processor.session != nil {
-		fileOptions.ResumePath = uploadResumePathForRelative(processor.partsDir, source.RelativePath)
+	if resumePath != "" {
+		fileOptions.ResumePath = resumePath
 	}
-	result, uploadErr := processor.deps.uploadFile(ctx, processor.uploadClient, parentID, filepath.Base(source.RelativePath), source.Size, file, fileOptions)
+	result, uploadErr := processor.deps.uploadFile(ctx, processor.uploadClient, parentID, fileName, source.Size, file, fileOptions)
 	closeErr := file.Close()
 	if uploadErr == nil && closeErr != nil {
 		uploadErr = closeErr
@@ -191,6 +275,9 @@ func (processor *recursiveUploadFileProcessor) process(ctx context.Context, sour
 	}
 	processor.progress.set(source.RelativePath, source.Size, source.Size)
 	outcome.Success = true
+	outcome.Uploaded = !result.Skipped
+	outcome.Verified = result.Verified
+	outcome.Skipped = result.Skipped
 	outcome.Rapid = result.Rapid
 	outcome.Resumed = result.Resumed || result.ResumedParts > 0
 	outcome.TransferredBytes = result.BytesUploaded
@@ -287,6 +374,15 @@ func applyRecursiveUploadFileResult(summary *uploadCommandSummary, outcome recur
 	}
 	summary.SucceededCount++
 	summary.TransferredBytes += outcome.TransferredBytes
+	if outcome.Uploaded {
+		summary.UploadedCount++
+	}
+	if outcome.Verified {
+		summary.VerifiedCount++
+	}
+	if outcome.Skipped {
+		summary.SkippedCount++
+	}
 	if outcome.Rapid {
 		summary.RapidCount++
 	}

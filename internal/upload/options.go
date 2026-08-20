@@ -92,6 +92,7 @@ type Options struct {
 	Progress            func(string)
 	ProgressBytes       func(completed, total int64)
 	ResumePath          string
+	PreparedDigest      *PreparedDigest
 	forceSequential     bool
 }
 

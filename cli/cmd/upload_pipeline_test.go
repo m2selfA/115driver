@@ -51,6 +51,222 @@ func (client *fakeUploadTreeClient) addFile(dirID, name string, size int64, sha1
 	client.lists[dirID] = append(client.lists[dirID], driver.File{Name: name, Size: size, Sha1: sha1})
 }
 
+func TestUploadSourceRequestsContentsForTrailingSeparator(t *testing.T) {
+	if !uploadSourceRequestsContents("source/") {
+		t.Fatal("trailing slash did not request contents mode")
+	}
+	backslash := uploadSourceRequestsContents(`source\\`)
+	if runtime.GOOS == "windows" && !backslash {
+		t.Fatal("Windows trailing backslash did not request contents mode")
+	}
+	if runtime.GOOS != "windows" && backslash {
+		t.Fatal("non-Windows trailing backslash unexpectedly requested contents mode")
+	}
+	if uploadSourceRequestsContents("source") {
+		t.Fatal("plain source path unexpectedly requested contents mode")
+	}
+}
+
+func TestPrepareRecursiveUploadDestinationPreservesSourceDirectoryByDefault(t *testing.T) {
+	parent := t.TempDir()
+	root := filepath.Join(parent, "20251004")
+	if err := os.MkdirAll(root, 0755); err != nil {
+		t.Fatal(err)
+	}
+	client := newFakeUploadTreeClient()
+	destination, rootID, err := prepareRecursiveUploadDestination(client, "/data/research/idpc", "root", root, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if destination != "/data/research/idpc/20251004" || rootID == "" || rootID == "root" {
+		t.Fatalf("unexpected preserved destination: path=%q id=%q", destination, rootID)
+	}
+	secondDestination, secondID, err := prepareRecursiveUploadDestination(client, "/data/research/idpc", "root", root, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if secondDestination != destination || secondID != rootID {
+		t.Fatalf("existing recursive upload root was not reused: first=(%q,%q) second=(%q,%q)", destination, rootID, secondDestination, secondID)
+	}
+	entries, _ := client.List("root")
+	if len(*entries) != 1 || (*entries)[0].Name != "20251004" || !(*entries)[0].IsDirectory {
+		t.Fatalf("unexpected remote parent contents: %#v", *entries)
+	}
+}
+
+func TestPrepareRecursiveUploadDestinationContentsModeUsesParentDirectly(t *testing.T) {
+	client := newFakeUploadTreeClient()
+	destination, rootID, err := prepareRecursiveUploadDestination(client, "/data/research/idpc", "root", t.TempDir(), true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if destination != "/data/research/idpc" || rootID != "root" {
+		t.Fatalf("contents mode changed destination: path=%q id=%q", destination, rootID)
+	}
+	entries, _ := client.List("root")
+	if len(*entries) != 0 {
+		t.Fatalf("contents mode unexpectedly created a source root: %#v", *entries)
+	}
+}
+
+func TestPrepareRecursiveUploadDestinationRejectsFileConflict(t *testing.T) {
+	parent := t.TempDir()
+	root := filepath.Join(parent, "source")
+	if err := os.MkdirAll(root, 0755); err != nil {
+		t.Fatal(err)
+	}
+	client := newFakeUploadTreeClient()
+	client.addFile("root", "source", 1, "SHA")
+	if _, _, err := prepareRecursiveUploadDestination(client, "/remote", "root", root, false); err == nil {
+		t.Fatal("expected same-name remote file conflict")
+	}
+}
+
+func TestExecuteRecursiveUploadPreservesSourceDirectoryRoot(t *testing.T) {
+	parent := t.TempDir()
+	root := filepath.Join(parent, "source")
+	if err := os.MkdirAll(root, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "child.bin"), []byte("payload"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	client := newFakeUploadTreeClient()
+	deps := uploadPipelineDeps{uploadFile: func(_ context.Context, _ *driver.Pan115Client, dirID, name string, size int64, _ *os.File, _ uploadpkg.Options) (uploadpkg.Result, error) {
+		client.addFile(dirID, name, size, "SHA")
+		return uploadpkg.Result{SHA1: "SHA", BytesUploaded: size}, nil
+	}}
+	summary, err := executeRecursiveUpload(context.Background(), client, nil, root, "/remote", "root", false, false, "", uploadpkg.DefaultOptions(), deps)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if summary.RemoteDir != "/remote/source" || summary.SucceededCount != 1 {
+		t.Fatalf("unexpected preserved upload summary: %#v", summary)
+	}
+	rootEntries, _ := client.List("root")
+	if len(*rootEntries) != 1 || (*rootEntries)[0].Name != "source" || !(*rootEntries)[0].IsDirectory {
+		t.Fatalf("source root was not created under destination: %#v", *rootEntries)
+	}
+	childEntries, _ := client.List((*rootEntries)[0].FileID)
+	if len(*childEntries) != 1 || (*childEntries)[0].Name != "child.bin" {
+		t.Fatalf("source contents were not uploaded below preserved root: %#v", *childEntries)
+	}
+}
+
+func TestExecuteRecursiveUploadSkipsFreshIdenticalRemoteFile(t *testing.T) {
+	root := t.TempDir()
+	path := filepath.Join(root, "a.bin")
+	if err := os.WriteFile(path, []byte("payload"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	digest, err := uploadpkg.PrepareFileDigest(file, 7)
+	_ = file.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := newFakeUploadTreeClient()
+	client.addFile("root", "a.bin", 7, digest.SHA1)
+	calls := 0
+	deps := uploadPipelineDeps{uploadFile: func(context.Context, *driver.Pan115Client, string, string, int64, *os.File, uploadpkg.Options) (uploadpkg.Result, error) {
+		calls++
+		return uploadpkg.Result{}, errors.New("identical remote file should have been skipped")
+	}}
+	summary, err := executeRecursiveUpload(context.Background(), client, nil, root, "/remote", "root", true, false, "", uploadpkg.DefaultOptions(), deps)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if calls != 0 || summary.SucceededCount != 1 || summary.UploadedCount != 0 || summary.VerifiedCount != 1 || summary.SkippedCount != 1 || summary.TransferredBytes != 0 {
+		t.Fatalf("unexpected identical-file result: calls=%d summary=%#v", calls, summary)
+	}
+}
+
+func TestExecuteRecursiveUploadReusesVerificationDigestWhenRemoteDiffers(t *testing.T) {
+	root := t.TempDir()
+	path := filepath.Join(root, "a.bin")
+	if err := os.WriteFile(path, []byte("payload"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	digest, err := uploadpkg.PrepareFileDigest(file, 7)
+	_ = file.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := newFakeUploadTreeClient()
+	client.addFile("root", "a.bin", 7, "0000000000000000000000000000000000000000")
+	calls := 0
+	deps := uploadPipelineDeps{uploadFile: func(_ context.Context, _ *driver.Pan115Client, dirID, name string, size int64, _ *os.File, options uploadpkg.Options) (uploadpkg.Result, error) {
+		calls++
+		if options.PreparedDigest == nil || options.PreparedDigest.SHA1 != digest.SHA1 || options.PreparedDigest.PreID != digest.PreID {
+			t.Fatalf("verification digest was not reused: %#v", options.PreparedDigest)
+		}
+		client.addFile(dirID, name, size, digest.SHA1)
+		return uploadpkg.Result{SHA1: digest.SHA1, BytesUploaded: size}, nil
+	}}
+	summary, err := executeRecursiveUpload(context.Background(), client, nil, root, "/remote", "root", true, false, "", uploadpkg.DefaultOptions(), deps)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if calls != 1 || summary.UploadedCount != 1 || summary.VerifiedCount != 0 || summary.SkippedCount != 0 || summary.TransferredBytes != 7 {
+		t.Fatalf("unexpected mismatched-file result: calls=%d summary=%#v", calls, summary)
+	}
+}
+
+func TestExecuteRecursiveUploadActiveFileResumeStateBypassesFreshRemoteSkip(t *testing.T) {
+	root := t.TempDir()
+	path := filepath.Join(root, "a.bin")
+	if err := os.WriteFile(path, []byte("payload"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	digest, err := uploadpkg.PrepareFileDigest(file, 7)
+	_ = file.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, partsDir, err := deriveTransferSessionPaths("upload", root, "/remote", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resumePath := uploadResumePathForRelative(partsDir, "a.bin")
+	if err := os.MkdirAll(filepath.Dir(resumePath), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(resumePath, []byte("active resume state"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	client := newFakeUploadTreeClient()
+	client.addFile("root", "a.bin", 7, digest.SHA1)
+	calls := 0
+	deps := uploadPipelineDeps{uploadFile: func(_ context.Context, _ *driver.Pan115Client, _ string, _ string, size int64, _ *os.File, options uploadpkg.Options) (uploadpkg.Result, error) {
+		calls++
+		if options.ResumePath != resumePath {
+			t.Fatalf("resume path was not preserved: got %q want %q", options.ResumePath, resumePath)
+		}
+		if options.PreparedDigest != nil {
+			t.Fatalf("active resume state should bypass fresh pre-verification digest: %#v", options.PreparedDigest)
+		}
+		return uploadpkg.Result{SHA1: digest.SHA1, BytesUploaded: size, Resumed: true}, nil
+	}}
+	summary, err := executeRecursiveUpload(context.Background(), client, nil, root, "/remote", "root", true, true, "", uploadpkg.DefaultOptions(), deps)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if calls != 1 || summary.UploadedCount != 1 || summary.SkippedCount != 0 || summary.ResumedCount != 1 {
+		t.Fatalf("active resume state was incorrectly short-circuited: calls=%d summary=%#v", calls, summary)
+	}
+}
+
 func TestExecuteRecursiveUploadSessionSkipsCompletedFilesOnSecondRun(t *testing.T) {
 	root := t.TempDir()
 	if err := os.MkdirAll(filepath.Join(root, "sub"), 0755); err != nil {
@@ -88,7 +304,7 @@ func TestExecuteRecursiveUploadSessionSkipsCompletedFilesOnSecondRun(t *testing.
 		return uploadpkg.Result{SHA1: sha1, BytesUploaded: size, Resumed: name == "b.bin" && calls[name] > 1}, nil
 	}}
 
-	first, err := executeRecursiveUpload(context.Background(), client, nil, root, "/remote", "root", true, "", options, deps)
+	first, err := executeRecursiveUpload(context.Background(), client, nil, root, "/remote", "root", true, true, "", options, deps)
 	if !errors.Is(err, errUploadIncomplete) {
 		t.Fatalf("expected incomplete first run, got summary=%#v err=%v", first, err)
 	}
@@ -106,7 +322,7 @@ func TestExecuteRecursiveUploadSessionSkipsCompletedFilesOnSecondRun(t *testing.
 		t.Fatalf("per-file upload resume state was not rooted below session parts dir: %v", resumePaths)
 	}
 
-	second, err := executeRecursiveUpload(context.Background(), client, nil, root, "/remote", "root", true, "", options, deps)
+	second, err := executeRecursiveUpload(context.Background(), client, nil, root, "/remote", "root", true, true, "", options, deps)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -170,7 +386,7 @@ func TestExecuteRecursiveUploadMapsPerFileProgressIntoTreeProgress(t *testing.T)
 		return uploadpkg.Result{BytesUploaded: size, SHA1: "SHA-" + name}, nil
 	}}
 
-	summary, err := executeRecursiveUpload(context.Background(), client, nil, root, "/remote", "root", false, "", options, deps)
+	summary, err := executeRecursiveUpload(context.Background(), client, nil, root, "/remote", "root", true, false, "", options, deps)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -228,7 +444,7 @@ func TestExecuteRecursiveUploadDistributesSequentialFilesAcrossInterfaces(t *tes
 	}
 	done := make(chan uploadResult, 1)
 	go func() {
-		summary, err := executeRecursiveUpload(context.Background(), client, nil, root, "/remote", "root", false, "", options, deps)
+		summary, err := executeRecursiveUpload(context.Background(), client, nil, root, "/remote", "root", true, false, "", options, deps)
 		done <- uploadResult{summary: summary, err: err}
 	}()
 
@@ -294,7 +510,7 @@ func TestExecuteRecursiveUploadUsesMultipleFileConnectionsOnOneSequentialInterfa
 	}
 	done := make(chan uploadResult, 1)
 	go func() {
-		summary, err := executeRecursiveUpload(context.Background(), client, nil, root, "/remote", "root", false, "", options, deps)
+		summary, err := executeRecursiveUpload(context.Background(), client, nil, root, "/remote", "root", true, false, "", options, deps)
 		done <- uploadResult{summary: summary, err: err}
 	}()
 	for i := 0; i < 2; i++ {
@@ -467,11 +683,41 @@ func TestScanLocalUploadTreeRejectsSymlinkAndSpecialSessionInsideRoot(t *testing
 	client := newFakeUploadTreeClient()
 	options := uploadpkg.DefaultOptions()
 	insideSession := filepath.Join(root, "session.json")
-	_, err := executeRecursiveUpload(context.Background(), client, nil, root, "/remote", "root", true, insideSession, options, uploadPipelineDeps{uploadFile: func(context.Context, *driver.Pan115Client, string, string, int64, *os.File, uploadpkg.Options) (uploadpkg.Result, error) {
+	_, err := executeRecursiveUpload(context.Background(), client, nil, root, "/remote", "root", false, true, insideSession, options, uploadPipelineDeps{uploadFile: func(context.Context, *driver.Pan115Client, string, string, int64, *os.File, uploadpkg.Options) (uploadpkg.Result, error) {
 		return uploadpkg.Result{}, nil
 	}})
 	if !errors.Is(err, errUploadUsage) {
 		t.Fatalf("expected in-tree session rejection, got %v", err)
+	}
+	entries, _ := client.List("root")
+	if len(*entries) != 0 {
+		t.Fatalf("invalid session path created remote source root before validation: %#v", *entries)
+	}
+}
+
+func TestRecursiveUploadModesUseDistinctDefaultSessions(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "source")
+	if err := os.MkdirAll(root, 0755); err != nil {
+		t.Fatal(err)
+	}
+	preservedDestination, err := recursiveUploadDestinationPath("/remote", root, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	contentsDestination, err := recursiveUploadDestinationPath("/remote", root, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	preservedSession, _, err := deriveTransferSessionPaths("upload", root, preservedDestination, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	contentsSession, _, err := deriveTransferSessionPaths("upload", root, contentsDestination, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if preservedSession == contentsSession {
+		t.Fatalf("directory and contents modes share a default session: %q", preservedSession)
 	}
 }
 

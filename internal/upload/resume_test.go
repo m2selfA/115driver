@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"github.com/SheltonZhu/115driver/internal/transfer"
+	"github.com/SheltonZhu/115driver/pkg/crypto/ec115"
 	"github.com/SheltonZhu/115driver/pkg/driver"
 	"github.com/aliyun/aliyun-oss-go-sdk/oss"
 )
@@ -104,6 +105,25 @@ func TestRunUploadWithRecoveryRetriesVerificationFailure(t *testing.T) {
 	}
 	if len(progress) != 1 || progress[0] != 0 {
 		t.Fatalf("recovery should reset absolute byte progress before retry: %v", progress)
+	}
+}
+
+func TestRunUploadWithRecoveryRetriesInvalidEncryptedResponse(t *testing.T) {
+	attempts := 0
+	options := DefaultOptions()
+	options.Retries = 2
+	result, err := runUploadWithRecovery(context.Background(), options.Retries, options, 100, func(attempt int) (Result, error) {
+		attempts++
+		if attempt == 0 {
+			return Result{}, ec115.ErrInvalidCiphertext
+		}
+		return Result{BytesUploaded: 100}, nil
+	}, func(context.Context, int) error { return nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if attempts != 2 || result.BytesUploaded != 100 {
+		t.Fatalf("invalid encrypted response was not retried: attempts=%d result=%#v", attempts, result)
 	}
 }
 

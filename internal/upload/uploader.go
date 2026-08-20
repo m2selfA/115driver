@@ -20,6 +20,8 @@ type Result struct {
 	Multipart     bool
 	Sequential    bool
 	Resumed       bool
+	Verified      bool
+	Skipped       bool
 	ResumedParts  int
 	BytesUploaded int64
 	PartCount     int
@@ -67,21 +69,15 @@ func uploadFileWithoutResume(ctx context.Context, client *driver.Pan115Client, d
 	if client.UploadMetaInfo != nil && fileSize > client.UploadMetaInfo.SizeLimit {
 		return result, driver.ErrUploadTooLarge
 	}
-	if _, err := file.Seek(0, io.SeekStart); err != nil {
-		return result, fmt.Errorf("seek upload file before digest: %w", err)
-	}
-	digest, err := client.GetDigestResult(file)
+	digest, err := resolveUploadDigest(file, fileSize, options.PreparedDigest)
 	if err != nil {
-		return result, fmt.Errorf("calculate upload digest: %w", err)
+		return result, err
 	}
-	if digest.Size != fileSize {
-		return result, fmt.Errorf("upload file size changed during preparation: stat=%d digest=%d", fileSize, digest.Size)
-	}
-	result.SHA1 = digest.QuickID
+	result.SHA1 = digest.SHA1
 	if options.Progress != nil {
 		options.Progress("Checking 115 rapid upload...")
 	}
-	fastInfo, err := client.RapidUpload(digest.Size, fileName, dirID, digest.PreID, digest.QuickID, file)
+	fastInfo, err := client.RapidUpload(digest.Size, fileName, dirID, digest.PreID, digest.SHA1, file)
 	if err != nil {
 		return result, err
 	}
@@ -104,9 +100,9 @@ func uploadFileWithoutResume(ctx context.Context, client *driver.Pan115Client, d
 	}
 	params := fastInfo.UploadOSSParams
 	if params.SHA1 == "" {
-		params.SHA1 = digest.QuickID
+		params.SHA1 = digest.SHA1
 	}
-	if !strings.EqualFold(params.SHA1, digest.QuickID) {
+	if !strings.EqualFold(params.SHA1, digest.SHA1) {
 		return result, errors.New("115 upload initialization returned a different file SHA1")
 	}
 	requireSequentialUploadCompatibility(&options, &params)

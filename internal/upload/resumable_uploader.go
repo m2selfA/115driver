@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/SheltonZhu/115driver/internal/transfer"
+	"github.com/SheltonZhu/115driver/pkg/crypto/ec115"
 	"github.com/SheltonZhu/115driver/pkg/driver"
 	"github.com/aliyun/aliyun-oss-go-sdk/oss"
 )
@@ -119,7 +120,7 @@ func isRecoverableUploadFailure(err error) bool {
 	if err == nil || errors.Is(err, context.Canceled) {
 		return false
 	}
-	if isUploadVerificationFailure(err) || errors.Is(err, driver.ErrUploadFailed) ||
+	if isUploadVerificationFailure(err) || errors.Is(err, driver.ErrUploadFailed) || errors.Is(err, ec115.ErrInvalidCiphertext) ||
 		errors.Is(err, transfer.ErrNetworkPathFailure) || errors.Is(err, transfer.ErrUploadPartScheduleIncomplete) || errors.Is(err, ErrUploadMultipartGone) ||
 		errors.Is(err, context.DeadlineExceeded) || isOSSAuthError(err) || isOSSNoSuchUpload(err) {
 		return true
@@ -204,19 +205,13 @@ func uploadFileResumable(ctx context.Context, client *driver.Pan115Client, dirID
 	if client.UploadMetaInfo != nil && fileSize > client.UploadMetaInfo.SizeLimit {
 		return result, driver.ErrUploadTooLarge
 	}
-	if _, err := file.Seek(0, io.SeekStart); err != nil {
-		return result, fmt.Errorf("seek upload file before digest: %w", err)
-	}
-	digest, err := client.GetDigestResult(file)
+	digest, err := resolveUploadDigest(file, fileSize, options.PreparedDigest)
 	if err != nil {
-		return result, fmt.Errorf("calculate upload digest: %w", err)
+		return result, err
 	}
-	if digest.Size != fileSize {
-		return result, fmt.Errorf("upload file size changed during preparation: stat=%d digest=%d", fileSize, digest.Size)
-	}
-	result.SHA1 = digest.QuickID
+	result.SHA1 = digest.SHA1
 
-	state, err := loadUploadResume(options.ResumePath, dirID, fileName, fileSize, digest.QuickID)
+	state, err := loadUploadResume(options.ResumePath, dirID, fileName, fileSize, digest.SHA1)
 	if err != nil {
 		return result, err
 	}
@@ -230,7 +225,7 @@ func uploadFileResumable(ctx context.Context, client *driver.Pan115Client, dirID
 		// After a 115 verification rejection, do not accept the old target as a
 		// shortcut while the state is prepared for a forced clean re-upload.
 		if !(state.ForceSequential && state.Phase == uploadResumePhasePrepared) {
-			present, checkErr := uploadTargetAlreadyPresent(client, dirID, fileName, fileSize, digest.QuickID)
+			present, checkErr := uploadTargetAlreadyPresent(client, dirID, fileName, fileSize, digest.SHA1)
 			if checkErr != nil {
 				return result, fmt.Errorf("verify resumable upload target: %w", checkErr)
 			}
@@ -240,8 +235,10 @@ func uploadFileResumable(ctx context.Context, client *driver.Pan115Client, dirID
 					return result, err
 				}
 				result.Resumed = true
+				result.Verified = true
+				result.Skipped = true
 				options.reportBytes(fileSize, fileSize)
-				result.BytesUploaded = fileSize
+				result.BytesUploaded = 0
 				result.Duration = time.Since(started)
 				return result, nil
 			}
@@ -254,7 +251,7 @@ func uploadFileResumable(ctx context.Context, client *driver.Pan115Client, dirID
 		}
 	}
 	if state == nil {
-		prepared := newPreparedUploadResume(dirID, fileName, fileSize, digest.QuickID)
+		prepared := newPreparedUploadResume(dirID, fileName, fileSize, digest.SHA1)
 		state = &prepared
 		if err := saveUploadResume(options.ResumePath, *state); err != nil {
 			return result, err
@@ -269,7 +266,7 @@ func uploadFileResumable(ctx context.Context, client *driver.Pan115Client, dirID
 	if options.Progress != nil {
 		options.Progress("Checking 115 rapid upload...")
 	}
-	fastInfo, err := client.RapidUpload(digest.Size, fileName, dirID, digest.PreID, digest.QuickID, file)
+	fastInfo, err := client.RapidUpload(digest.Size, fileName, dirID, digest.PreID, digest.SHA1, file)
 	if err != nil {
 		return result, err
 	}
@@ -294,9 +291,9 @@ func uploadFileResumable(ctx context.Context, client *driver.Pan115Client, dirID
 
 	params := fastInfo.UploadOSSParams
 	if params.SHA1 == "" {
-		params.SHA1 = digest.QuickID
+		params.SHA1 = digest.SHA1
 	}
-	if !strings.EqualFold(params.SHA1, digest.QuickID) {
+	if !strings.EqualFold(params.SHA1, digest.SHA1) {
 		return result, errors.New("115 upload initialization returned a different file SHA1")
 	}
 	requireSequentialUploadCompatibility(&options, &params)

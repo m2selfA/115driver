@@ -238,6 +238,21 @@ Additional env vars: `DRIVER115_CONFIG` (config path), `DRIVER115_PROFILE` (prof
 
 # Upload & Download
 115driver upload /local/file /remote/dir
+
+# Recursive upload preserves the source directory name by default:
+# /local/20251004 -> /remote/dir/20251004/...
+115driver upload -r /local/20251004 /remote/dir
+
+# A trailing source separator uploads only the directory contents:
+# /local/20251004/ -> /remote/dir/...
+115driver upload -r /local/20251004/ /remote/dir
+# --contents is the explicit, cross-platform equivalent:
+115driver upload -r --contents /local/20251004 /remote/dir
+
+# Re-running an upload checks same-name/same-size remote files by SHA1.
+# Identical files are verified and skipped instead of entering rapid-upload/OSS.
+115driver upload -r /local/20251004 /remote/dir
+
 115driver download /remote/file /local/dir
 115driver download /remote/file /local/dir --timeout 6h  # default 2h, 0 disables timeout
 
@@ -252,6 +267,36 @@ Additional env vars: `DRIVER115_CONFIG` (config path), `DRIVER115_PROFILE` (prof
 115driver offline list
 115driver offline rm <hash>
 ```
+
+### Recursive Upload Path Semantics
+
+Recursive upload follows source-object semantics by default: the source directory itself is copied into the destination directory, similar to `cp -r source destination` or `rsync -a source destination`.
+
+```text
+local/source/
+└── child.bin
+```
+
+```bash
+115driver upload -r /local/source /remote/destination
+# -> /remote/destination/source/child.bin
+```
+
+To copy only the contents of the source directory, add a trailing `/` (a trailing `\` is also recognized on Windows) or pass `--contents` explicitly:
+
+```bash
+115driver upload -r /local/source/ /remote/destination
+115driver upload -r --contents /local/source /remote/destination
+# -> /remote/destination/child.bin
+```
+
+`--contents` is recommended in scripts when you want the intent to remain explicit across shells and platforms. The two modes use different effective remote destinations, so resumable transfer sessions cannot accidentally cross between "copy directory" and "copy contents" semantics.
+
+Uploads are idempotent for already-matching files. When the destination contains a same-name regular file with the same size and a SHA1 value, 115driver hashes the local file and compares SHA1 before starting rapid-upload or OSS. A match is reported as verified/skipped; a mismatch continues through the normal upload path, reusing the digest that was already computed for verification. Files with a different size, or remote entries without a usable SHA1, are not treated as identical.
+
+An active per-file resume state takes precedence over this fresh pre-check. This preserves resumable multipart recovery and the forced sequential compatibility path used after 115 upload verification errors such as code `10002`; the resumable upload core decides whether an interrupted target may safely be reused.
+
+For recursive uploads in `--json` mode, `remote_dir` remains the destination argument supplied by the caller, `destination` reports the effective remote directory receiving the scanned tree, and `contents` reports which directory semantic was selected. The result also reports `uploaded`, `verified`, `skipped`, and `transferred_bytes`; an all-identical rerun can therefore complete with every file verified/skipped and zero files uploaded.
 
 ### JSON Output
 

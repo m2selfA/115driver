@@ -7,6 +7,7 @@ import (
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"hash/crc32"
 	"math/big"
@@ -16,6 +17,8 @@ import (
 	"github.com/andreburgaud/crypt2go/padding"
 	"github.com/pierrec/lz4/v4"
 )
+
+var ErrInvalidCiphertext = errors.New("invalid 115 ECDH ciphertext")
 
 var remotePubKey = []byte{
 	0x57, 0xA2, 0x92, 0x57, 0xCD, 0x23, 0x20, 0xE5,
@@ -130,11 +133,16 @@ func (c *EcdhCipher) Encrypt(plainText []byte) ([]byte, error) {
 func (c *EcdhCipher) Decrypt(cipherText []byte) (text []byte, e error) {
 	defer func() {
 		if err := recover(); err != nil {
-			e = fmt.Errorf("%v", err)
+			text = nil
+			e = fmt.Errorf("%w: %v", ErrInvalidCiphertext, err)
 		}
 	}()
 
-	cipherText = cipherText[0 : len(cipherText)-len(cipherText)%aes.BlockSize]
+	alignedLength := len(cipherText) - len(cipherText)%aes.BlockSize
+	if alignedLength < aes.BlockSize {
+		return nil, fmt.Errorf("%w: encrypted response is %d bytes", ErrInvalidCiphertext, len(cipherText))
+	}
+	cipherText = cipherText[:alignedLength]
 
 	block, err := aes.NewCipher(c.key)
 	if err != nil {
@@ -146,10 +154,16 @@ func (c *EcdhCipher) Decrypt(cipherText []byte) (text []byte, e error) {
 	mode.CryptBlocks(lz4Block, cipherText)
 
 	length := int(lz4Block[0]) + int(lz4Block[1])<<8
+	if length <= 0 || length+2 > len(lz4Block) {
+		return nil, fmt.Errorf("%w: declared compressed payload is %d bytes but decrypted frame is %d bytes", ErrInvalidCiphertext, length, len(lz4Block))
+	}
 	text = make([]byte, 0x2000)
 	l, err := lz4.UncompressBlock(lz4Block[2:length+2], text)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("%w: decompress response: %v", ErrInvalidCiphertext, err)
+	}
+	if l < 0 || l > len(text) {
+		return nil, fmt.Errorf("%w: decompressed length %d exceeds buffer %d", ErrInvalidCiphertext, l, len(text))
 	}
 
 	return text[:l], nil
