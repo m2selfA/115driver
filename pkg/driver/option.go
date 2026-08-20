@@ -206,7 +206,12 @@ type ListOptions struct {
 
 func DefaultListOptions() *ListOptions {
 	return &ListOptions{
-		ApiURLs: []string{ApiFileList},
+		// webapi.115.com/files is subject to account-level risk control that can
+		// return an Aliyun 405 block page for requests carrying cid. APS is a
+		// Web-cookie-compatible HTTPS primary with the same list response shape.
+		// Keep defaults HTTPS-only so credentials never downgrade to the legacy
+		// http://web.api.115.com endpoint.
+		ApiURLs: []string{ApiFileListByName, ApiFileList},
 	}
 }
 
@@ -221,12 +226,7 @@ func WithApiURLs(urls ...string) ListOption {
 }
 
 func WithMultiUrls() ListOption {
-	return WithApiURLs([]string{
-		ApiFileList,
-		ApiFileList1,
-		// ApiFileList2,
-		// ApiFileList3,
-	}...)
+	return WithApiURLs(ApiFileListByName, ApiFileList)
 }
 
 type OfflineOptions struct {

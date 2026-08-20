@@ -1,6 +1,7 @@
 package driver
 
 import (
+	"fmt"
 	"strings"
 
 	"github.com/go-resty/resty/v2"
@@ -44,66 +45,86 @@ func (c *Pan115Client) ListWithLimit(dirID string, limit int64, opts ...ListOpti
 	}
 
 	o := DefaultListOptions()
-	if len(opts) > 0 {
-		for _, opt := range opts {
-			opt(o)
-		}
+	for _, opt := range opts {
+		opt(o)
+	}
+	if len(o.ApiURLs) == 0 {
+		return nil, fmt.Errorf("no file-list API endpoints configured")
 	}
 
-	apiURLs := o.ApiURLs
-	var files []File
-	offset := int64(0)
-	for i := 0; ; i++ {
-		apiURL := apiURLs[i%len(apiURLs)]
-		req := c.NewRequest().ForceContentType("application/json;charset=UTF-8")
-		getFilesOpts := []GetFileOptions{
-			WithApiURL(apiURL),
-			WithLimit(limit),
-			WithOffset(offset),
-		}
-		result, err := GetFiles(req, dirID, getFilesOpts...)
-		if err != nil {
-			return nil, err
-		}
-		for _, fileInfo := range result.Files {
-			files = append(files, *(&File{}).from(&fileInfo))
-		}
-		offset = int64(result.Offset) + limit
-		if offset >= int64(result.Count) {
-			break
+	var lastErr error
+	for _, apiURL := range o.ApiURLs {
+		files := make([]File, 0)
+		offset := int64(0)
+		for {
+			req := c.NewRequest().ForceContentType("application/json;charset=UTF-8")
+			result, err := GetFiles(req, dirID, WithApiURL(apiURL), WithLimit(limit), WithOffset(offset))
+			if err != nil {
+				lastErr = err
+				break
+			}
+			if int64(result.Count) <= offset {
+				return &files, nil
+			}
+			if int64(result.Offset) != offset {
+				lastErr = fmt.Errorf("file-list response offset mismatch: endpoint=%s requested=%d response=%d count=%d", apiURL, offset, result.Offset, result.Count)
+				break
+			}
+			for _, fileInfo := range result.Files {
+				files = append(files, *(&File{}).from(&fileInfo))
+			}
+			nextOffset := int64(result.Offset) + int64(len(result.Files))
+			if nextOffset >= int64(result.Count) {
+				return &files, nil
+			}
+			if nextOffset <= offset {
+				lastErr = fmt.Errorf("file-list pagination made no progress: endpoint=%s requested=%d response=%d returned=%d count=%d", apiURL, offset, result.Offset, len(result.Files), result.Count)
+				break
+			}
+			offset = nextOffset
 		}
 	}
-	return &files, nil
+	if lastErr == nil {
+		lastErr = fmt.Errorf("file-list failed without an endpoint error")
+	}
+	return nil, lastErr
 }
 
 // ListPage list files and directories with page
 func (c *Pan115Client) ListPage(dirID string, offset, limit int64, opts ...ListOption) (*[]File, error) {
 	o := DefaultListOptions()
-	if len(opts) > 0 {
-		for _, opt := range opts {
-			opt(o)
-		}
+	for _, opt := range opts {
+		opt(o)
+	}
+	if len(o.ApiURLs) == 0 {
+		return nil, fmt.Errorf("no file-list API endpoints configured")
 	}
 
-	apiURLs := o.ApiURLs
-	var files []File
-	req := c.NewRequest().ForceContentType("application/json;charset=UTF-8")
-	getFilesOpts := []GetFileOptions{
-		WithApiURL(apiURLs[0]),
-		WithLimit(limit),
-		WithOffset(offset),
-	}
-	result, err := GetFiles(req, dirID, getFilesOpts...)
-	if err != nil {
-		return nil, err
-	}
-	if int64(result.Count) <= offset {
+	var lastErr error
+	for _, apiURL := range o.ApiURLs {
+		req := c.NewRequest().ForceContentType("application/json;charset=UTF-8")
+		result, err := GetFiles(req, dirID, WithApiURL(apiURL), WithLimit(limit), WithOffset(offset))
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		if int64(result.Count) > offset && int64(result.Offset) != offset {
+			lastErr = fmt.Errorf("file-list response offset mismatch: endpoint=%s requested=%d response=%d count=%d", apiURL, offset, result.Offset, result.Count)
+			continue
+		}
+		files := make([]File, 0, len(result.Files))
+		if int64(result.Count) <= offset {
+			return &files, nil
+		}
+		for _, fileInfo := range result.Files {
+			files = append(files, *(&File{}).from(&fileInfo))
+		}
 		return &files, nil
 	}
-	for _, fileInfo := range result.Files {
-		files = append(files, *(&File{}).from(&fileInfo))
+	if lastErr == nil {
+		lastErr = fmt.Errorf("file-list failed without an endpoint error")
 	}
-	return &files, nil
+	return nil, lastErr
 }
 
 func GetFiles(req *resty.Request, dirID string, opts ...GetFileOptions) (*FileListResp, error) {
@@ -111,10 +132,8 @@ func GetFiles(req *resty.Request, dirID string, opts ...GetFileOptions) (*FileLi
 		dirID = "0"
 	}
 	o := DefaultGetFileOptions()
-	if len(opts) > 0 {
-		for _, opt := range opts {
-			opt(o)
-		}
+	for _, opt := range opts {
+		opt(o)
 	}
 	result := FileListResp{}
 	params := map[string]string{
@@ -131,16 +150,19 @@ func GetFiles(req *resty.Request, dirID string, opts ...GetFileOptions) (*FileLi
 		"format":           "json",
 		"fc_mix":           "0",
 	}
-	req = req.SetQueryParams(params).
-		SetResult(&result)
+	req = req.SetQueryParams(params).SetResult(&result)
+	if o.GetApiURL() == ApiFileListByName {
+		req.SetQueryParam("o", FileOrderByName)
+		req.SetQueryParam("natsort", "1")
+	}
 	resp, err := req.Get(o.GetApiURL())
 	if err = CheckErr(err, &result, resp); err != nil {
 		return &FileListResp{}, err
 	}
 	if dirID != string(result.CategoryID) {
-		return &FileListResp{}, err
+		return &FileListResp{}, fmt.Errorf("file-list response directory mismatch: requested=%s response=%s", dirID, result.CategoryID)
 	}
-	return &result, err
+	return &result, nil
 }
 
 func (c *Pan115Client) DirName2CID(dir string) (*APIGetDirIDResp, error) {
