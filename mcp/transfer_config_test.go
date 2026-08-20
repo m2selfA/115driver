@@ -29,7 +29,7 @@ cookie = "UID=1;CID=2"
 [transfer]
 interfaces = "Ethernet 2,3"
 strategy = "file"
-workers_per_interface = 1
+workers_per_interface = 3
 probe_cache_ttl = "7m"
 retries = 5
 chunk_size = "64MiB"
@@ -45,7 +45,7 @@ url_refreshes = 5
 	if config.Interfaces != "Ethernet 2,3" || config.Strategy != "file" {
 		t.Fatalf("unexpected selector/strategy: %#v", config)
 	}
-	if config.WorkersPerInterface != 1 || config.ProbeCacheTTL != 7*time.Minute || config.Retries != 5 || config.ChunkSize != "64MiB" || config.HealthCooldown != 7*time.Second || config.HealthCooldownMax != 50*time.Second || config.Resume || config.URLRefreshes != 5 {
+	if config.WorkersPerInterface != 3 || config.ProbeCacheTTL != 7*time.Minute || config.Retries != 5 || config.ChunkSize != "64MiB" || config.HealthCooldown != 7*time.Second || config.HealthCooldownMax != 50*time.Second || config.Resume || config.URLRefreshes != 5 {
 		t.Fatalf("unexpected transfer config: %#v", config)
 	}
 }

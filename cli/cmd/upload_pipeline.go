@@ -97,6 +97,10 @@ func executeRecursiveUpload(
 	for _, file := range tree.Files {
 		summary.TotalBytes += file.Size
 	}
+	if options.Progress != nil {
+		options.Progress(fmt.Sprintf("Preparing recursive upload: %d file(s)...", summary.FileCount))
+	}
+	treeProgress := newRecursiveUploadProgress(summary.TotalBytes, options.ProgressBytes)
 
 	var session *transfer.TransferTreeSession
 	partsDir := ""
@@ -151,95 +155,50 @@ func executeRecursiveUpload(
 		}
 	}
 
-	for _, source := range tree.Files {
+	processor := &recursiveUploadFileProcessor{
+		uploadClient: uploadClient,
+		deps:         deps,
+		directoryIDs: directoryIDs,
+		listings:     listings,
+		session:      session,
+		sessionFiles: sessionFiles,
+		partsDir:     partsDir,
+		options:      options,
+		progress:     treeProgress,
+		fileCount:    len(tree.Files),
+	}
+	for fileIndex, source := range tree.Files {
+		outcome := processor.process(ctx, source, fileIndex, "")
+		if outcome.Fatal != nil {
+			return summary, outcome.Fatal
+		}
+		applyRecursiveUploadFileResult(&summary, outcome)
 		if err := ctx.Err(); err != nil {
-			summary.Failures = append(summary.Failures, uploadCommandFailure{RelativePath: source.RelativePath, Err: err})
-			break
-		}
-		parentRelative := filepath.Dir(source.RelativePath)
-		if parentRelative == "." {
-			parentRelative = ""
-		}
-		parentID, ok := directoryIDs[parentRelative]
-		if !ok {
-			return summary, fmt.Errorf("remote parent for %q was not prepared", source.RelativePath)
+			return summary, err
 		}
 
-		if state, ok := sessionFiles[source.RelativePath]; ok && state.Completed {
-			matches := remoteUploadFileExists(listings[parentRelative], filepath.Base(source.RelativePath), source.Size, state.SHA1)
-			if matches {
-				summary.SucceededCount++
-				summary.ResumedCount++
-				continue
-			}
-			if err := session.MarkFilePending(source.RelativePath, errors.New("previously completed remote file is no longer present")); err != nil {
-				return summary, err
-			}
-		}
-
-		info, err := os.Lstat(source.FullPath)
-		if err != nil {
-			summary.Failures = append(summary.Failures, uploadCommandFailure{RelativePath: source.RelativePath, Err: err})
-			if session != nil {
-				_ = session.MarkFilePending(source.RelativePath, err)
-			}
+		if options.Compatibility == nil || !options.Compatibility.SequentialRequired() || fileIndex+1 >= len(tree.Files) {
 			continue
 		}
-		if !info.Mode().IsRegular() || info.Size() != source.Size || info.ModTime().UnixNano() != source.ModTimeUnixNano {
-			err := errors.New("local file changed after the recursive upload scan")
-			summary.Failures = append(summary.Failures, uploadCommandFailure{RelativePath: source.RelativePath, Err: err})
-			if session != nil {
-				_ = session.MarkFilePending(source.RelativePath, err)
-			}
+		paths := options.Compatibility.NetworkPaths()
+		workersPerInterface := options.WorkersPerInterface
+		if workersPerInterface <= 0 {
+			workersPerInterface = 1
+		}
+		if len(paths)*workersPerInterface < 2 {
 			continue
 		}
-		file, err := os.Open(source.FullPath)
-		if err != nil {
-			summary.Failures = append(summary.Failures, uploadCommandFailure{RelativePath: source.RelativePath, Err: err})
-			if session != nil {
-				_ = session.MarkFilePending(source.RelativePath, err)
-			}
-			continue
+		if options.Progress != nil {
+			options.Progress(fmt.Sprintf("Sequential OSS compatibility active; distributing %d remaining file(s) across %d interface(s) with up to %d connection(s) each...", len(tree.Files)-fileIndex-1, len(paths), workersPerInterface))
 		}
-		fileOptions := options
-		if session != nil {
-			fileOptions.ResumePath = uploadResumePathForRelative(partsDir, source.RelativePath)
+		outcomes, concurrentErr := processor.processConcurrent(ctx, tree.Files[fileIndex+1:], fileIndex+1, paths)
+		for _, concurrentOutcome := range outcomes {
+			applyRecursiveUploadFileResult(&summary, concurrentOutcome)
 		}
-		result, uploadErr := deps.uploadFile(ctx, uploadClient, parentID, filepath.Base(source.RelativePath), source.Size, file, fileOptions)
-		closeErr := file.Close()
-		if uploadErr == nil && closeErr != nil {
-			uploadErr = closeErr
+		if concurrentErr != nil {
+			return summary, concurrentErr
 		}
-		if result.SHA1 != "" && session != nil {
-			if err := session.SetFileSHA1(source.RelativePath, result.SHA1); err != nil {
-				return summary, err
-			}
-			sessionFiles[source.RelativePath] = transfer.TransferTreeSessionFile{
-				RelativePath: source.RelativePath, Size: source.Size, ModTimeUnixNano: source.ModTimeUnixNano, SHA1: result.SHA1,
-			}
-		}
-		if uploadErr != nil {
-			summary.Failures = append(summary.Failures, uploadCommandFailure{RelativePath: source.RelativePath, Err: uploadErr})
-			if session != nil {
-				if err := session.MarkFilePending(source.RelativePath, uploadErr); err != nil {
-					return summary, err
-				}
-			}
-			continue
-		}
-		if session != nil {
-			if err := session.MarkFileCompleted(source.RelativePath); err != nil {
-				return summary, err
-			}
-		}
-		summary.SucceededCount++
-		summary.TransferredBytes += result.BytesUploaded
-		if result.Rapid {
-			summary.RapidCount++
-		}
-		if result.Resumed || result.ResumedParts > 0 {
-			summary.ResumedCount++
-		}
+		break
 	}
 
 	summary.FailedCount = summary.FileCount - summary.SucceededCount
@@ -289,6 +248,12 @@ func scanLocalUploadTree(root string) (localUploadTree, error) {
 		if err != nil {
 			return err
 		}
+		if is115DriverTransferStateName(entry.Name(), info.IsDir()) {
+			if info.IsDir() {
+				return filepath.SkipDir
+			}
+			return nil
+		}
 		if info.IsDir() {
 			tree.Directories = append(tree.Directories, relative)
 			return nil
@@ -314,6 +279,22 @@ func scanLocalUploadTree(root string) (localUploadTree, error) {
 	})
 	sort.Slice(tree.Files, func(i, j int) bool { return tree.Files[i].RelativePath < tree.Files[j].RelativePath })
 	return tree, nil
+}
+
+func is115DriverTransferStateName(name string, isDir bool) bool {
+	if !strings.Contains(name, ".115driver-") {
+		return false
+	}
+	if isDir {
+		return strings.HasSuffix(name, ".session.json.parts")
+	}
+	if strings.HasSuffix(name, ".session.json") {
+		return true
+	}
+	// TransferTreeSession persists through os.CreateTemp using
+	// ".<session-basename>.*". A process crash may leave that temporary file
+	// behind, so exclude it from later recursive uploads as transfer state too.
+	return strings.Contains(name, ".session.json.")
 }
 
 func ensureRemoteUploadDirectories(client uploadTreeClient, rootID string, directories []string, session *transfer.TransferTreeSession) (map[string]string, map[string][]driver.File, error) {

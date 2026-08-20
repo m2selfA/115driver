@@ -17,18 +17,19 @@ import (
 const defaultDownloadTimeout = 2 * time.Hour
 
 var (
-	downloadTimeout    = defaultDownloadTimeout
-	downloadRecursive  bool
-	downloadInterfaces string
-	downloadStrategy   string
-	downloadChunkSize  string
-	downloadSession    string
+	downloadTimeout             = defaultDownloadTimeout
+	downloadRecursive           bool
+	downloadInterfaces          string
+	downloadStrategy            string
+	downloadChunkSize           string
+	downloadSession             string
+	downloadWorkersPerInterface int
 )
 
 var downloadCmd = &cobra.Command{
 	Use:   "download <remote_path> <local_path>",
 	Short: "Download a file or recursively download a directory",
-	Long:  "Download through the configured transfer strategy. 'file' assigns whole files across interfaces; 'chunk' splits each file into HTTP byte ranges and aggregates all Range-capable interfaces. For directories, use --recursive; directory contents are written below local_path and transfer.resume maintains a persistent resumable directory session.",
+	Long:  "Download through the configured transfer strategy. 'file' assigns whole files across interface connection slots; 'chunk' splits each file into HTTP byte ranges and can use multiple connections on every Range-capable interface. transfer.workers_per_interface controls connection slots per physical interface. Recoverable range/file failures resume automatically. For directories, use --recursive; directory contents are written below local_path and transfer.resume maintains a persistent resumable directory session.",
 	Args:  cobra.ExactArgs(2),
 	RunE: func(cmd *cobra.Command, args []string) error {
 		if err := validateDownloadTimeout(downloadTimeout); err != nil {
@@ -37,6 +38,12 @@ var downloadCmd = &cobra.Command{
 		transferConfig, err := auth.ResolveTransferConfig(configPath)
 		if err != nil {
 			return &exitError{code: output.ExitArgs, msg: err.Error()}
+		}
+		if cmd.Flags().Changed("workers-per-interface") {
+			if downloadWorkersPerInterface <= 0 {
+				return &exitError{code: output.ExitArgs, msg: "--workers-per-interface must be > 0"}
+			}
+			transferConfig.WorkersPerInterface = downloadWorkersPerInterface
 		}
 		if strings.TrimSpace(downloadInterfaces) != "" {
 			transferConfig.Interfaces = strings.TrimSpace(downloadInterfaces)
@@ -128,9 +135,10 @@ func validateDownloadTimeout(timeout time.Duration) error {
 func init() {
 	downloadCmd.Flags().DurationVar(&downloadTimeout, "timeout", defaultDownloadTimeout, "Download timeout per file, use 0 to disable")
 	downloadCmd.Flags().BoolVarP(&downloadRecursive, "recursive", "r", false, "Recursively download a directory into local_path")
-	downloadCmd.Flags().StringVar(&downloadSession, "session", "", "Override persistent recursive-download session file path (requires transfer.resume=true)")
+	downloadCmd.Flags().StringVarP(&downloadSession, "session", "s", "", "Override persistent recursive-download session file path (requires transfer.resume=true)")
 	downloadCmd.Flags().StringVar(&downloadInterfaces, "interfaces", "", "Override transfer interfaces (auto, or comma-separated interface names/indexes/IPs)")
 	downloadCmd.Flags().StringVar(&downloadStrategy, "strategy", "", "Override transfer strategy (file or chunk)")
 	downloadCmd.Flags().StringVar(&downloadChunkSize, "chunk-size", "", "Override chunk strategy range size (for example 32MiB)")
+	downloadCmd.Flags().IntVar(&downloadWorkersPerInterface, "workers-per-interface", 0, "Override independent connections per physical interface")
 	rootCmd.AddCommand(downloadCmd)
 }

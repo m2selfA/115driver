@@ -46,7 +46,7 @@ func TestDownloadTransferConfigRejectsUnsupportedSettings(t *testing.T) {
 	}{
 		{name: "empty interfaces", mutate: func(c *DownloadTransferConfig) { c.Interfaces = "" }},
 		{name: "unknown strategy", mutate: func(c *DownloadTransferConfig) { c.Strategy = "future" }},
-		{name: "multiple workers", mutate: func(c *DownloadTransferConfig) { c.WorkersPerInterface = 2 }},
+		{name: "zero workers", mutate: func(c *DownloadTransferConfig) { c.WorkersPerInterface = 0 }},
 		{name: "zero cache ttl", mutate: func(c *DownloadTransferConfig) { c.ProbeCacheTTL = 0 }},
 		{name: "negative retries", mutate: func(c *DownloadTransferConfig) { c.Retries = -1 }},
 		{name: "negative URL refreshes", mutate: func(c *DownloadTransferConfig) { c.URLRefreshes = -1 }},
@@ -80,7 +80,7 @@ func TestDownloadThroughTransferWiresP1P2AndScheduler(t *testing.T) {
 		WithDownloadTransferConfig(DownloadTransferConfig{
 			Interfaces:          "auto",
 			Strategy:            "file",
-			WorkersPerInterface: 1,
+			WorkersPerInterface: 3,
 			ProbeCacheTTL:       5 * time.Minute,
 			Retries:             2,
 			ChunkSize:           "32MiB",
@@ -163,8 +163,8 @@ func TestDownloadThroughTransferWiresP1P2AndScheduler(t *testing.T) {
 			for _, opt := range opts {
 				opt(&options)
 			}
-			if options.Retries != 2 {
-				t.Fatalf("unexpected scheduler retries: %d", options.Retries)
+			if options.Retries != 2 || options.WorkersPerInterface != 3 {
+				t.Fatalf("unexpected scheduler tuning: %#v", options)
 			}
 			if options.HealthTracker == nil {
 				t.Fatal("expected P8 health tracker")
@@ -210,7 +210,7 @@ func TestDownloadThroughTransferChunkUsesRangePathsAndChunkSettings(t *testing.T
 		WithDownloadTimeout(90*time.Second),
 		WithDownloadMaxBytes(1024),
 		WithDownloadTransferConfig(DownloadTransferConfig{
-			Interfaces: "auto", Strategy: "chunk", WorkersPerInterface: 1,
+			Interfaces: "auto", Strategy: "chunk", WorkersPerInterface: 3,
 			ProbeCacheTTL: 5 * time.Minute, Retries: 2, ChunkSize: "4MiB", Resume: true, URLRefreshes: 3,
 		}),
 	)
@@ -263,7 +263,7 @@ func TestDownloadThroughTransferChunkUsesRangePathsAndChunkSettings(t *testing.T
 	if result.BytesWritten != 100 || result.StatusCode != http.StatusPartialContent || result.NetworkPath.InterfaceIndex != 2 {
 		t.Fatalf("unexpected converted chunk result: %#v", result)
 	}
-	if captured.ChunkSize != 4<<20 || captured.Retries != 2 || captured.Timeout != 90*time.Second || captured.MaxBytes != 1024 {
+	if captured.ChunkSize != 4<<20 || captured.Retries != 2 || captured.RecoveryRetries != 2 || captured.WorkersPerInterface != 3 || captured.Timeout != 90*time.Second || captured.MaxBytes != 1024 {
 		t.Fatalf("chunk settings were not preserved: %#v", captured)
 	}
 	if captured.ResumeKey != "pick" || captured.MaxRefreshes != 3 {

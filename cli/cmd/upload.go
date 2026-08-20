@@ -16,16 +16,17 @@ import (
 )
 
 var (
-	uploadInterfaces string
-	uploadChunkSize  string
-	uploadTimeout    time.Duration
-	uploadRecursive  bool
-	uploadSession    string
+	uploadInterfaces          string
+	uploadChunkSize           string
+	uploadTimeout             time.Duration
+	uploadRecursive           bool
+	uploadSession             string
+	uploadWorkersPerInterface int
 )
 
 func buildUploadOptions(config auth.TransferConfig, interfacesOverride, chunkSizeOverride string, timeout time.Duration) (uploadpkg.Options, error) {
-	if config.WorkersPerInterface != 1 {
-		return uploadpkg.Options{}, fmt.Errorf("transfer currently requires workers_per_interface = 1, got %d", config.WorkersPerInterface)
+	if config.WorkersPerInterface <= 0 {
+		return uploadpkg.Options{}, fmt.Errorf("transfer.workers_per_interface must be > 0")
 	}
 	if timeout < 0 {
 		return uploadpkg.Options{}, fmt.Errorf("upload timeout must be >= 0")
@@ -52,14 +53,15 @@ func buildUploadOptions(config auth.TransferConfig, interfacesOverride, chunkSiz
 		return uploadpkg.Options{}, err
 	}
 	return uploadpkg.Options{
-		Interfaces: interfaces, ChunkSize: chunkSize, Retries: config.Retries, Timeout: timeout, HealthTracker: health,
+		Interfaces: interfaces, ChunkSize: chunkSize, Retries: config.Retries, WorkersPerInterface: config.WorkersPerInterface,
+		Timeout: timeout, HealthTracker: health, Compatibility: uploadpkg.NewUploadCompatibilityState(),
 	}, nil
 }
 
 var uploadCmd = &cobra.Command{
 	Use:   "upload <local_path> <remote_dir>",
 	Short: "Upload a file or recursively upload a directory",
-	Long:  "Upload with 115 rapid-upload first. If OSS data transfer is required, the default automatically selects reachable interfaces and uses one multipart worker per physical interface. Use --recursive for directories; resumable transfer sessions are enabled by transfer.resume.",
+	Long:  "Upload with 115 rapid-upload first. If OSS data transfer is required, reachable interfaces are selected automatically. Recoverable network/finalization failures retry using transfer.retries. When the 115 callback requires OSS SHA1 context, or if 115 rejects multipart verification, upload automatically uses strict sequential OSS mode with interface failover for protocol compatibility. transfer.workers_per_interface controls independent connections per physical interface for ordinary multipart uploads and concurrent recursive files. Use --recursive for directories; resumable transfer sessions are enabled by transfer.resume.",
 	Args:  cobra.ExactArgs(2),
 	RunE: func(cmd *cobra.Command, args []string) error {
 		localPath := args[0]
@@ -73,6 +75,12 @@ var uploadCmd = &cobra.Command{
 		if err != nil {
 			return &exitError{code: output.ExitArgs, msg: err.Error()}
 		}
+		if cmd.Flags().Changed("workers-per-interface") {
+			if uploadWorkersPerInterface <= 0 {
+				return &exitError{code: output.ExitArgs, msg: "--workers-per-interface must be > 0"}
+			}
+			transferConfig.WorkersPerInterface = uploadWorkersPerInterface
+		}
 		uploadOptions, err := buildUploadOptions(transferConfig, uploadInterfaces, uploadChunkSize, uploadTimeout)
 		if err != nil {
 			return &exitError{code: output.ExitArgs, msg: err.Error()}
@@ -80,9 +88,8 @@ var uploadCmd = &cobra.Command{
 		if strings.TrimSpace(uploadSession) != "" && !transferConfig.Resume {
 			return &exitError{code: output.ExitArgs, msg: "--session requires transfer.resume=true"}
 		}
-		if !jsonOutput {
-			uploadOptions.Progress = func(message string) { fmt.Fprintln(os.Stderr, message) }
-		}
+		finishUploadProgress := configureCLIUploadProgress(&uploadOptions)
+		defer finishUploadProgress()
 
 		stat, err := os.Lstat(localPath)
 		if err != nil {
@@ -103,6 +110,7 @@ var uploadCmd = &cobra.Command{
 				}
 				return &exitError{code: output.ExitError, msg: message}
 			}
+			finishUploadProgress()
 			printer.PrintSuccess(map[string]interface{}{
 				"local_path": localPath, "remote_dir": remoteDir, "files": summary.FileCount,
 				"succeeded": summary.SucceededCount, "rapid": summary.RapidCount, "resumed": summary.ResumedCount,
@@ -146,6 +154,7 @@ var uploadCmd = &cobra.Command{
 		for _, path := range uploadResult.NetworkPaths {
 			interfaces = append(interfaces, path.String())
 		}
+		finishUploadProgress()
 		printer.PrintSuccess(map[string]interface{}{
 			"local_path": localPath, "remote_dir": remoteDir, "size": stat.Size(), "rapid": uploadResult.Rapid,
 			"multipart": uploadResult.Multipart, "parts": uploadResult.PartCount, "resumed": uploadResult.Resumed,
@@ -160,9 +169,10 @@ var uploadCmd = &cobra.Command{
 
 func init() {
 	uploadCmd.Flags().BoolVarP(&uploadRecursive, "recursive", "r", false, "Recursively upload a directory's contents while preserving hierarchy")
-	uploadCmd.Flags().StringVar(&uploadSession, "session", "", "Override persistent upload session file path (requires transfer.resume=true)")
+	uploadCmd.Flags().StringVarP(&uploadSession, "session", "s", "", "Override persistent upload session file path (requires transfer.resume=true)")
 	uploadCmd.Flags().StringVar(&uploadInterfaces, "interfaces", "", "Override upload interfaces (auto, or comma-separated interface names/indexes/IPs)")
 	uploadCmd.Flags().StringVar(&uploadChunkSize, "chunk-size", "", "Override OSS multipart part size (for example 32MiB)")
+	uploadCmd.Flags().IntVar(&uploadWorkersPerInterface, "workers-per-interface", 0, "Override independent connections per physical interface")
 	uploadCmd.Flags().DurationVar(&uploadTimeout, "timeout", uploadpkg.DefaultTimeout, "Upload timeout, use 0 to disable")
 	rootCmd.AddCommand(uploadCmd)
 }

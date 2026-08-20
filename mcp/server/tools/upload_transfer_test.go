@@ -17,6 +17,7 @@ func TestMCPUploadThroughTransferWiresMachineTransferConfig(t *testing.T) {
 	config.Interfaces = "Ethernet,2"
 	config.ChunkSize = "4MiB"
 	config.Retries = 2
+	config.WorkersPerInterface = 3
 	ft := NewFileTools(nil, WithDownloadTransferConfig(config))
 
 	file, err := os.CreateTemp(t.TempDir(), "upload-*.bin")
@@ -52,7 +53,7 @@ func TestMCPUploadThroughTransferWiresMachineTransferConfig(t *testing.T) {
 	if calls != 2 {
 		t.Fatalf("unexpected upload call count: %d", calls)
 	}
-	if captured.Interfaces != "Ethernet,2" || captured.ChunkSize != 4<<20 || captured.Retries != 2 || captured.Timeout != uploadpkg.DefaultTimeout {
+	if captured.Interfaces != "Ethernet,2" || captured.ChunkSize != 4<<20 || captured.Retries != 2 || captured.WorkersPerInterface != 3 || captured.Timeout != uploadpkg.DefaultTimeout {
 		t.Fatalf("P10 config was not preserved: %#v", captured)
 	}
 	if captured.HealthTracker == nil {

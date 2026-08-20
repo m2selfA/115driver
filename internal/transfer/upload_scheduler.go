@@ -36,28 +36,34 @@ type UploadPartResult struct {
 type UploadPartFunc func(context.Context, NetworkPath, UploadPartJob) (UploadPartResult, error)
 
 type UploadPartSchedulerOptions struct {
-	Retries       int
-	HealthTracker *NetworkHealthTracker
-	PreserveOrder bool
+	Retries             int
+	WorkersPerInterface int
+	HealthTracker       *NetworkHealthTracker
+	PreserveOrder       bool
 }
 
 type UploadPartSchedulerOption func(*UploadPartSchedulerOptions)
 
 func DefaultUploadPartSchedulerOptions() UploadPartSchedulerOptions {
-	return UploadPartSchedulerOptions{Retries: DefaultUploadPartRetries}
+	return UploadPartSchedulerOptions{Retries: DefaultUploadPartRetries, WorkersPerInterface: 1}
 }
 
 func WithUploadPartRetries(retries int) UploadPartSchedulerOption {
 	return func(options *UploadPartSchedulerOptions) { options.Retries = retries }
 }
 
+func WithUploadPartWorkersPerInterface(workers int) UploadPartSchedulerOption {
+	return func(options *UploadPartSchedulerOptions) { options.WorkersPerInterface = workers }
+}
+
 func WithUploadPartHealthTracker(tracker *NetworkHealthTracker) UploadPartSchedulerOption {
 	return func(options *UploadPartSchedulerOptions) { options.HealthTracker = tracker }
 }
 
-// WithUploadPartPreserveOrder forces strict input-order dispatch. It is intended
-// for OSS sequential multipart mode and therefore requires exactly one network
-// path; a failed part is retried before any later part is sent.
+// WithUploadPartPreserveOrder forces strict input-order dispatch with at most
+// one part in flight globally. It is intended for OSS sequential multipart mode;
+// multiple physical paths may remain available so a failed part can retry on a
+// different healthy interface before any later part is sent.
 func WithUploadPartPreserveOrder(preserve bool) UploadPartSchedulerOption {
 	return func(options *UploadPartSchedulerOptions) { options.PreserveOrder = preserve }
 }
@@ -119,11 +125,12 @@ type uploadPartWorkerResult struct {
 	attempt     UploadPartAttempt
 }
 
-// ScheduleUploadParts fans one multipart upload across physical interfaces.
-// Each supplied interface owns exactly one worker. Parts are drawn from a
-// shared queue, so faster paths naturally consume more work; a failed part is
-// retried on another healthy interface when possible. Only network-classified
-// failures affect P8 health/cooldown.
+// ScheduleUploadParts fans one multipart upload across connection slots on the
+// supplied physical interfaces. Ordinary multipart mode can create multiple
+// slots per interface; all slots share physical-interface P8 health/cooldown.
+// PreserveOrder instead permits only one part globally in flight while retaining
+// alternate interfaces for ordered failover. Only network-classified failures
+// affect P8 health/cooldown.
 func ScheduleUploadParts(
 	ctx context.Context,
 	paths []NetworkPath,
@@ -152,6 +159,12 @@ func ScheduleUploadParts(
 	if options.HealthTracker == nil {
 		options.HealthTracker = NewDefaultNetworkHealthTracker()
 	}
+	workerPaths := expandWorkerPaths(paths, options.WorkersPerInterface)
+	if options.PreserveOrder {
+		// Sequential OSS is one ordered stream. Keep one slot per physical path
+		// only for path failover; never create parallel slots for this object.
+		workerPaths = expandWorkerPaths(paths, 1)
+	}
 
 	states := make([]uploadPartState, len(jobs))
 	pending := make([]int, len(jobs))
@@ -160,11 +173,11 @@ func ScheduleUploadParts(
 		pending[i] = i
 	}
 
-	taskChannels := make([]chan uploadPartTask, len(paths))
-	attemptResults := make(chan uploadPartWorkerResult, len(paths))
+	taskChannels := make([]chan uploadPartTask, len(workerPaths))
+	attemptResults := make(chan uploadPartWorkerResult, len(workerPaths))
 	var workers sync.WaitGroup
-	workers.Add(len(paths))
-	for workerIndex, path := range paths {
+	workers.Add(len(workerPaths))
+	for workerIndex, path := range workerPaths {
 		tasks := make(chan uploadPartTask)
 		taskChannels[workerIndex] = tasks
 		go func(workerIndex int, workerPath NetworkPath, workerTasks <-chan uploadPartTask) {
@@ -180,7 +193,7 @@ func ScheduleUploadParts(
 			}
 		}(workerIndex, path, tasks)
 	}
-	idleWorkers := make([]int, len(paths))
+	idleWorkers := make([]int, len(workerPaths))
 	for i := range idleWorkers {
 		idleWorkers[i] = i
 	}
@@ -189,7 +202,7 @@ func ScheduleUploadParts(
 
 	for finished < len(states) {
 		if ctx.Err() == nil {
-			inFlight += dispatchUploadPartTasks(states, paths, &pending, &idleWorkers, taskChannels, options.HealthTracker, options.PreserveOrder)
+			inFlight += dispatchUploadPartTasks(states, workerPaths, &pending, &idleWorkers, taskChannels, options.HealthTracker, options.PreserveOrder)
 		} else if len(pending) > 0 {
 			for _, stateIndex := range pending {
 				state := &states[stateIndex]
@@ -209,7 +222,7 @@ func ScheduleUploadParts(
 			if len(pending) == 0 {
 				break
 			}
-			waited, waitErr := waitForNetworkHealth(ctx, options.HealthTracker, paths)
+			waited, waitErr := waitForNetworkHealth(ctx, options.HealthTracker, workerPaths)
 			if waitErr != nil {
 				continue
 			}
@@ -317,6 +330,9 @@ func validateUploadPartSchedule(paths []NetworkPath, jobs []UploadPartJob, uploa
 	if options.Retries < 0 {
 		return errors.New("upload part retries must be >= 0")
 	}
+	if options.WorkersPerInterface <= 0 {
+		return errors.New("upload part workers per interface must be > 0")
+	}
 	if len(jobs) == 0 {
 		return nil
 	}
@@ -325,9 +341,6 @@ func validateUploadPartSchedule(paths []NetworkPath, jobs []UploadPartJob, uploa
 	}
 	if len(paths) == 0 {
 		return errors.New("upload part scheduler requires at least one network path")
-	}
-	if options.PreserveOrder && len(paths) != 1 {
-		return errors.New("ordered upload part scheduling requires exactly one network path")
 	}
 	seenInterfaces := make(map[int]struct{}, len(paths))
 	for _, path := range paths {
@@ -372,17 +385,15 @@ func dispatchUploadPartTasks(states []uploadPartState, paths []NetworkPath, pend
 		*pending = append((*pending)[:jobPos], (*pending)[jobPos+1:]...)
 		taskChannels[workerIndex] <- uploadPartTask{stateIndex: stateIndex, attempt: len(state.attempts) + 1, job: state.job}
 		dispatched++
+		if preserveOrder {
+			break
+		}
 	}
 	return dispatched
 }
 
 func findEligibleUploadPartDispatch(states []uploadPartState, paths []NetworkPath, pending, idleWorkers []int, health *NetworkHealthTracker, preserveOrder bool) (int, int) {
-	availableCount := 0
-	for _, path := range paths {
-		if health.Available(path) {
-			availableCount++
-		}
-	}
+	availableCount := availablePhysicalInterfaceCount(paths, health)
 	bestWorkerPos, bestJobPos, bestScore := -1, -1, -1
 	for workerPos, workerIndex := range idleWorkers {
 		path := paths[workerIndex]

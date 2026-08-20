@@ -155,6 +155,48 @@ func TestScheduleFileDownloadsUsesOneConcurrentWorkerPerInterface(t *testing.T) 
 	}
 }
 
+func TestScheduleFileDownloadsUsesMultipleConnectionSlotsOnOneInterface(t *testing.T) {
+	dir := t.TempDir()
+	path := testNetworkPath(1, "10.0.0.1")
+	jobs := make([]FileTransferJob, 6)
+	for i := range jobs {
+		jobs[i] = testScheduledFileJob(dir, fmt.Sprintf("slot-%d", i), int64(100-i))
+	}
+	var active atomic.Int32
+	var maxActive atomic.Int32
+	var entered atomic.Int32
+	release := make(chan struct{})
+	download := func(ctx context.Context, request FileDownloadRequest) (FileDownloadResult, error) {
+		current := active.Add(1)
+		defer active.Add(-1)
+		for {
+			prior := maxActive.Load()
+			if current <= prior || maxActive.CompareAndSwap(prior, current) {
+				break
+			}
+		}
+		if entered.Add(1) == 3 {
+			close(release)
+		}
+		select {
+		case <-release:
+		case <-ctx.Done():
+			return FileDownloadResult{}, ctx.Err()
+		case <-time.After(time.Second):
+			return FileDownloadResult{}, errors.New("single-interface slots did not overlap")
+		}
+		return successfulScheduledDownload(request), nil
+	}
+	report, err := scheduleFileDownloads(context.Background(), []NetworkPath{path}, jobs, download,
+		WithFileScheduleRetries(0), WithFileScheduleWorkersPerInterface(3))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.SucceededCount() != len(jobs) || maxActive.Load() != 3 {
+		t.Fatalf("unexpected single-interface connection concurrency: max=%d report=%#v", maxActive.Load(), report)
+	}
+}
+
 func TestScheduleFileDownloadsSuccessHookRunsImmediatelyAndHookFailureStopsPending(t *testing.T) {
 	dir := t.TempDir()
 	paths := []NetworkPath{testNetworkPath(1, "10.0.0.1")}
@@ -237,6 +279,30 @@ func TestScheduleFileDownloadsUsesPerJobCDNPaths(t *testing.T) {
 	}
 	if len(report.Results[0].Attempts) != 2 || report.Results[0].Attempts[0].NetworkPath.InterfaceIndex != 2 {
 		t.Fatalf("unexpected per-file path report: %#v", report.Results[0])
+	}
+}
+
+func TestScheduleFileDownloadsRetriesTransientServerStatusWithoutCoolingInterface(t *testing.T) {
+	dir := t.TempDir()
+	path := testNetworkPath(1, "10.0.0.1")
+	health := NewDefaultNetworkHealthTracker()
+	calls := 0
+	report, err := scheduleFileDownloads(context.Background(), []NetworkPath{path}, []FileTransferJob{testScheduledFileJob(dir, "transient", 10)}, func(_ context.Context, request FileDownloadRequest) (FileDownloadResult, error) {
+		calls++
+		if calls == 1 {
+			return FileDownloadResult{NetworkPath: request.NetworkPath}, transientDownloadStatusError(http.StatusServiceUnavailable)
+		}
+		return successfulScheduledDownload(request), nil
+	}, WithFileScheduleRetries(1), WithFileScheduleHealthTracker(health))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if calls != 2 || report.SucceededCount() != 1 {
+		t.Fatalf("transient status was not retried: calls=%d report=%#v", calls, report)
+	}
+	snapshot := health.Snapshot(path)
+	if snapshot.Failures != 0 || snapshot.Successes != 1 {
+		t.Fatalf("server transient status polluted interface health: %#v", snapshot)
 	}
 }
 

@@ -413,6 +413,7 @@ func TestExecuteDownloadCommandChunkUsesLiveRangePathsAndChunkSettings(t *testin
 	options.Strategy = "chunk"
 	options.ChunkSize = 6
 	options.Retries = 2
+	options.WorkersPerInterface = 3
 	options.Timeout = 90 * time.Second
 	root := filepath.Join(t.TempDir(), "chunk-root")
 	summary, err := executeDownloadCommand(context.Background(), client, "/root", root, options, deps)
@@ -422,7 +423,7 @@ func TestExecuteDownloadCommandChunkUsesLiveRangePathsAndChunkSettings(t *testin
 	if summary.SucceededCount != 1 || summary.TransferredBytes != 10 || len(summary.ChunkResults) != 1 {
 		t.Fatalf("unexpected chunk summary: %#v", summary)
 	}
-	if captured.ChunkSize != 6 || captured.Retries != 2 || captured.Timeout != 90*time.Second || captured.ExpectedSize != 10 {
+	if captured.ChunkSize != 6 || captured.Retries != 2 || captured.RecoveryRetries != 2 || captured.WorkersPerInterface != 3 || captured.Timeout != 90*time.Second || captured.ExpectedSize != 10 {
 		t.Fatalf("chunk settings were not preserved: %#v", captured)
 	}
 	if captured.ResumeKey != "pa" || captured.MaxRefreshes != transfer.DefaultDownloadURLRefreshes || captured.Refresh == nil {
@@ -450,6 +451,15 @@ func TestValidateDownloadCommandOptionsAcceptsChunkAndRejectsUnknownStrategy(t *
 	if err := validateDownloadCommandOptions(options); err != nil {
 		t.Fatalf("chunk strategy should be accepted: %v", err)
 	}
+	options.WorkersPerInterface = 3
+	if err := validateDownloadCommandOptions(options); err != nil {
+		t.Fatalf("multiple workers per interface should be accepted: %v", err)
+	}
+	options.WorkersPerInterface = 0
+	if err := validateDownloadCommandOptions(options); err == nil {
+		t.Fatal("expected zero workers per interface to be rejected")
+	}
+	options.WorkersPerInterface = 1
 	options.Strategy = "future"
 	if err := validateDownloadCommandOptions(options); err == nil {
 		t.Fatal("expected unknown strategy to be rejected")

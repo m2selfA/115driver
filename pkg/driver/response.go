@@ -2,6 +2,7 @@ package driver
 
 import (
 	"encoding/json"
+	"fmt"
 	"time"
 )
 
@@ -33,7 +34,9 @@ func (resp *LoginResp) Err(respBody ...string) error {
 type BasicResp struct {
 	Errno   StringInt `json:"errno,omitempty"`
 	ErrNo   int       `json:"errNo,omitempty"`
+	Code    int       `json:"code,omitempty"`
 	Error   string    `json:"error,omitempty"`
+	Message string    `json:"message,omitempty"`
 	State   bool      `json:"state,omitempty"`
 	Errtype string    `json:"errtype,omitempty"`
 	Msg     string    `json:"msg,omitempty"`
@@ -43,7 +46,7 @@ func (resp *BasicResp) Err(respBody ...string) error {
 	if resp.State {
 		return nil
 	}
-	nonZeroCode := findNonZero(int(resp.Errno), resp.ErrNo)
+	nonZeroCode := findNonZero(int(resp.Errno), resp.ErrNo, resp.Code)
 	if len(respBody) > 0 {
 		return GetErr(nonZeroCode, respBody[0])
 	}
@@ -416,6 +419,20 @@ type UploadResult struct {
 		IsVideo  int    `json:"is_video"`
 	} `json:"data"`
 }
+
+func (resp *UploadResult) Err(respBody ...string) error {
+	if resp.State {
+		return nil
+	}
+	if resp.Code == 10002 {
+		if len(respBody) > 0 {
+			return fmt.Errorf("%s: %w", respBody[0], ErrUploadVerificationFailed)
+		}
+		return ErrUploadVerificationFailed
+	}
+	return resp.BasicResp.Err(respBody...)
+}
+
 type APIGetDirIDResp struct {
 	BasicResp
 	CategoryID IntString `json:"id"`

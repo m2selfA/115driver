@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"unicode"
 
@@ -30,11 +31,34 @@ func deriveTransferSessionPaths(direction, localAnchor, remoteTarget, override s
 		if base == "" {
 			base = "transfer"
 		}
-		digest := sha256.Sum256([]byte(strings.Join([]string{direction, localAbs, remoteTarget}, "\x00")))
+		identityPath := canonicalTransferSessionLocalPath(localAbs)
+		digest := sha256.Sum256([]byte(strings.Join([]string{direction, identityPath, remoteTarget}, "\x00")))
 		shortHash := hex.EncodeToString(digest[:6])
 		sessionPath = filepath.Join(filepath.Dir(localAbs), fmt.Sprintf(".%s.115driver-%s-%s.session.json", base, direction, shortHash))
+
+		// Before Windows path identities were canonicalized, changing only path
+		// casing could produce a second session file. Prefer the canonical name,
+		// but keep discovering a legacy session created with the exact raw path.
+		if identityPath != localAbs {
+			if _, err := os.Lstat(sessionPath); os.IsNotExist(err) {
+				legacyDigest := sha256.Sum256([]byte(strings.Join([]string{direction, localAbs, remoteTarget}, "\x00")))
+				legacyHash := hex.EncodeToString(legacyDigest[:6])
+				legacyPath := filepath.Join(filepath.Dir(localAbs), fmt.Sprintf(".%s.115driver-%s-%s.session.json", base, direction, legacyHash))
+				if _, legacyErr := os.Lstat(legacyPath); legacyErr == nil {
+					sessionPath = legacyPath
+				}
+			}
+		}
 	}
 	return sessionPath, sessionPath + ".parts", nil
+}
+
+func canonicalTransferSessionLocalPath(path string) string {
+	cleaned := filepath.Clean(path)
+	if runtime.GOOS == "windows" {
+		return strings.ToLower(cleaned)
+	}
+	return cleaned
 }
 
 func uploadResumePathForRelative(partsDir, relative string) string {

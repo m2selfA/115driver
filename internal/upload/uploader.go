@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/SheltonZhu/115driver/internal/transfer"
@@ -28,11 +29,11 @@ type Result struct {
 	SHA1          string
 }
 
-// UploadFile performs 115 rapid-upload negotiation first. When object data is
-// required, the actual OSS data plane is bound to the selected local network
-// interfaces. Multi-interface uploads use ordinary concurrent multipart upload;
-// the 115 callback receives the already-computed whole-file SHA1 instead of
-// relying on OSS sequential hash context.
+// uploadFileWithoutResume performs 115 rapid-upload negotiation first. When
+// object data is required, the OSS data plane is bound to selected local network
+// interfaces. Protocol callbacks that require ${sha1} use one interface with
+// OSS sequential SHA1 context; only callback forms that do not require that
+// context may use ordinary multi-interface multipart upload.
 func uploadFileWithoutResume(ctx context.Context, client *driver.Pan115Client, dirID, fileName string, fileSize int64, file *os.File, options Options) (Result, error) {
 	started := time.Now()
 	result := Result{}
@@ -94,6 +95,7 @@ func uploadFileWithoutResume(ctx context.Context, client *driver.Pan115Client, d
 	if rapid {
 		result.Rapid = true
 		result.BytesUploaded = fileSize
+		options.reportBytes(fileSize, fileSize)
 		result.Duration = time.Since(started)
 		return result, nil
 	}
@@ -107,24 +109,33 @@ func uploadFileWithoutResume(ctx context.Context, client *driver.Pan115Client, d
 	if !strings.EqualFold(params.SHA1, digest.QuickID) {
 		return result, errors.New("115 upload initialization returned a different file SHA1")
 	}
+	requireSequentialUploadCompatibility(&options, &params)
 	endpoint := client.GetOSSEndpoint(client.UseInternalUpload)
 	probeURL, err := buildOSSProbeURL(endpoint, params.Bucket)
 	if err != nil {
 		return result, err
 	}
+	if options.HealthTracker == nil {
+		options.HealthTracker = transfer.NewDefaultNetworkHealthTracker()
+	}
 	selection, err := resolveUploadPaths(ctx, options.Interfaces, probeURL)
 	if err != nil {
 		return result, err
 	}
+	if options.Compatibility != nil {
+		options.Compatibility.ObserveNetworkPaths(selection.Paths)
+	}
+	selection = applyUploadCompatibilitySelection(options, selection)
 	result.NetworkPaths = append([]transfer.NetworkPath(nil), selection.Paths...)
 	if options.Progress != nil {
 		if selection.Warning != nil {
 			options.Progress(fmt.Sprintf("Network warning: %v", selection.Warning))
 		}
-		options.Progress(fmt.Sprintf("Using %d interface(s) for OSS upload...", len(selection.Paths)))
-	}
-	if options.HealthTracker == nil {
-		options.HealthTracker = transfer.NewDefaultNetworkHealthTracker()
+		if options.forceSequential {
+			options.Progress(fmt.Sprintf("Using %d interface(s) for sequential compatibility failover (one ordered part at a time)...", len(selection.Paths)))
+		} else {
+			options.Progress(fmt.Sprintf("Using %d interface(s), up to %d connection(s) each for OSS upload...", len(selection.Paths), options.WorkersPerInterface))
+		}
 	}
 	pool := newOSSBucketPool(client, endpoint, params.Bucket)
 	defer pool.close()
@@ -138,6 +149,7 @@ func uploadFileWithoutResume(ctx context.Context, client *driver.Pan115Client, d
 		if err := client.CheckUploadStatus(dirID, params.SHA1); err != nil {
 			return result, err
 		}
+		options.reportBytes(fileSize, fileSize)
 		result.BytesUploaded = fileSize
 		result.Duration = time.Since(started)
 		return result, nil
@@ -147,7 +159,7 @@ func uploadFileWithoutResume(ctx context.Context, client *driver.Pan115Client, d
 	if err != nil {
 		return result, err
 	}
-	sequential := len(selection.Paths) == 1
+	sequential := options.forceSequential
 	result.Multipart = true
 	result.Sequential = sequential
 	result.PartCount = len(jobs)
@@ -164,9 +176,14 @@ func uploadFileWithoutResume(ctx context.Context, client *driver.Pan115Client, d
 		}
 	}()
 
+	var completedBytes atomic.Int64
 	report, scheduleErr := transfer.ScheduleUploadParts(ctx, selection.Paths, jobs, func(ctx context.Context, path transfer.NetworkPath, job transfer.UploadPartJob) (transfer.UploadPartResult, error) {
-		return uploadPartWithRefresh(ctx, pool, imur, file, path, job)
-	}, transfer.WithUploadPartRetries(options.Retries), transfer.WithUploadPartHealthTracker(options.HealthTracker), transfer.WithUploadPartPreserveOrder(sequential))
+		partResult, partErr := uploadPartWithRefresh(ctx, pool, imur, file, path, job)
+		if partErr == nil {
+			options.reportBytes(completedBytes.Add(job.Size), fileSize)
+		}
+		return partResult, partErr
+	}, transfer.WithUploadPartRetries(options.Retries), transfer.WithUploadPartWorkersPerInterface(options.WorkersPerInterface), transfer.WithUploadPartHealthTracker(options.HealthTracker), transfer.WithUploadPartPreserveOrder(sequential))
 	if scheduleErr != nil {
 		return result, scheduleErr
 	}
@@ -187,6 +204,7 @@ func uploadFileWithoutResume(ctx context.Context, client *driver.Pan115Client, d
 	if err := parseUploadCallback(body, params.SHA1); err != nil {
 		return result, err
 	}
+	options.reportBytes(fileSize, fileSize)
 	completed = true
 	result.BytesUploaded = fileSize
 	result.Duration = time.Since(started)

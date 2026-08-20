@@ -21,11 +21,12 @@ func TestBuildUploadOptionsUsesTransferDefaultsAndOverrides(t *testing.T) {
 	}
 }
 
-func TestBuildUploadOptionsRejectsUnsupportedWorkerCountAndChunkSize(t *testing.T) {
+func TestBuildUploadOptionsAcceptsMultipleWorkersAndRejectsInvalidChunkSize(t *testing.T) {
 	config := auth.DefaultTransferConfig()
 	config.WorkersPerInterface = 2
-	if _, err := buildUploadOptions(config, "", "", time.Hour); err == nil {
-		t.Fatal("expected multiple workers per physical interface to be rejected")
+	options, err := buildUploadOptions(config, "", "", time.Hour)
+	if err != nil || options.WorkersPerInterface != 2 {
+		t.Fatalf("multiple workers per physical interface were not preserved: options=%#v err=%v", options, err)
 	}
 	config = auth.DefaultTransferConfig()
 	if _, err := buildUploadOptions(config, "", "1.5MiB", time.Hour); err == nil {

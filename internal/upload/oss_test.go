@@ -144,7 +144,7 @@ func TestOSSUploadPartNetworkFailureFeedsP8HealthClassification(t *testing.T) {
 	}
 }
 
-func TestParallelMultipartUsesSameUploadIDAcrossBoundOSSClientsAndInjectsSHA1(t *testing.T) {
+func TestParallelMultipartUsesSameUploadIDAcrossBoundOSSClientsWhenCallbackAllowsIt(t *testing.T) {
 	path1 := transfer.NetworkPath{InterfaceName: "Ethernet 1", InterfaceIndex: 1, LocalIP: net.ParseIP("10.0.0.1")}
 	path2 := transfer.NetworkPath{InterfaceName: "Ethernet 2", InterfaceIndex: 2, LocalIP: net.ParseIP("10.0.1.1")}
 	paths := []transfer.NetworkPath{path1, path2}
@@ -191,8 +191,8 @@ func TestParallelMultipartUsesSameUploadIDAcrossBoundOSSClientsAndInjectsSHA1(t 
 				if err != nil {
 					t.Fatalf("decode callback header: %v", err)
 				}
-				if strings.Contains(string(decodedCallback), "${sha1}") || !strings.Contains(string(decodedCallback), "ABCDEF1234") {
-					t.Fatalf("parallel complete callback did not contain known SHA1: %s", decodedCallback)
+				if string(decodedCallback) != `{"callbackBody":"name=${object}"}` {
+					t.Fatalf("parallel complete mutated opaque callback: %s", decodedCallback)
 				}
 				body, err := io.ReadAll(req.Body)
 				if err != nil {
@@ -234,7 +234,7 @@ func TestParallelMultipartUsesSameUploadIDAcrossBoundOSSClientsAndInjectsSHA1(t 
 		t.Fatalf("unexpected UploadPart result: %#v", partResult)
 	}
 	params := driver.UploadOSSParams{SHA1: "ABCDEF1234", Bucket: "bucket", Object: "object"}
-	params.Callback.Callback = `{"callbackBody":"sha1=${sha1}"}`
+	params.Callback.Callback = `{"callbackBody":"name=${object}"}`
 	params.Callback.CallbackVar = `{"x:dir":"U_1_0"}`
 	body, err := completeMultipart(context.Background(), pool, []transfer.NetworkPath{path2, path1}, imur, []oss.UploadPart{
 		{PartNumber: 2, ETag: `"etag-2"`}, {PartNumber: 1, ETag: `"etag-1"`},
@@ -275,25 +275,28 @@ func TestSequentialMultipartInitiatePreservesLegacySHA1Flags(t *testing.T) {
 	}
 }
 
-func TestMultipartCallbackParamsInjectsKnownSHA1WithoutMutatingOriginal(t *testing.T) {
+func TestUploadCallbackRequiresSequentialSHA1AndRemainsOpaque(t *testing.T) {
 	params := driver.UploadOSSParams{SHA1: "ABCDEF1234", Bucket: "bucket", Object: "object"}
 	params.Callback.Callback = `{"callbackBody":"sha1=${sha1}&name=${object}"}`
 	params.Callback.CallbackVar = `{"x:dir":"U_1_0"}`
+	if !uploadCallbackRequiresSequentialSHA1(&params) {
+		t.Fatal("115 callback with ${sha1} was not classified as sequential-only")
+	}
+	options := DefaultOptions()
+	if !requireSequentialUploadCompatibility(&options, &params) || !options.forceSequential || !options.Compatibility.SequentialRequired() {
+		t.Fatalf("callback did not latch sequential compatibility: %#v", options)
+	}
+	for _, sequential := range []bool{false, true} {
+		got := multipartCallbackParams(&params, sequential)
+		if got.Callback.Callback != params.Callback.Callback || got.Callback.CallbackVar != params.Callback.CallbackVar {
+			t.Fatalf("callback was mutated for sequential=%v: %#v", sequential, got.Callback)
+		}
+	}
 
-	parallel := multipartCallbackParams(&params, false)
-	if strings.Contains(parallel.Callback.Callback, "${sha1}") || !strings.Contains(parallel.Callback.Callback, "ABCDEF1234") {
-		t.Fatalf("parallel callback did not receive known whole-file SHA1: %q", parallel.Callback.Callback)
-	}
-	if parallel.Callback.CallbackVar != params.Callback.CallbackVar {
-		t.Fatalf("callback vars changed: got %q want %q", parallel.Callback.CallbackVar, params.Callback.CallbackVar)
-	}
-	if !strings.Contains(params.Callback.Callback, "${sha1}") {
-		t.Fatalf("original callback was mutated: %q", params.Callback.Callback)
-	}
-
-	sequential := multipartCallbackParams(&params, true)
-	if sequential.Callback.Callback != params.Callback.Callback {
-		t.Fatalf("single-interface sequential callback changed: %q", sequential.Callback.Callback)
+	safe := params
+	safe.Callback.Callback = `{"callbackBody":"name=${object}"}`
+	if uploadCallbackRequiresSequentialSHA1(&safe) {
+		t.Fatal("callback without ${sha1} was incorrectly forced to sequential mode")
 	}
 }
 
@@ -340,6 +343,32 @@ func TestBuildOSSProbeURLUsesBucketEndpoint(t *testing.T) {
 	}
 	if got != "http://bucket.127.0.0.1:8080/" {
 		t.Fatalf("unexpected endpoint normalization: %q", got)
+	}
+}
+
+func TestApplyUploadCompatibilitySelectionRetainsFailoverInterfaces(t *testing.T) {
+	paths := []transfer.NetworkPath{
+		{InterfaceName: "Ethernet 1", InterfaceIndex: 1, LocalIP: net.ParseIP("10.0.0.1")},
+		{InterfaceName: "Ethernet 2", InterfaceIndex: 2, LocalIP: net.ParseIP("10.0.1.1")},
+	}
+	selection := pathSelection{Paths: paths}
+	parallel := applyUploadCompatibilitySelection(Options{}, selection)
+	if len(parallel.Paths) != 2 {
+		t.Fatalf("normal upload unexpectedly lost interfaces: %#v", parallel.Paths)
+	}
+	fallback := applyUploadCompatibilitySelection(Options{forceSequential: true}, selection)
+	if len(fallback.Paths) != 2 || fallback.Paths[0].InterfaceIndex != 1 || fallback.Paths[1].InterfaceIndex != 2 {
+		t.Fatalf("sequential compatibility lost failover candidates: %#v", fallback.Paths)
+	}
+	if len(selection.Paths) != 2 {
+		t.Fatal("compatibility selection mutated the caller's path slice")
+	}
+
+	health := transfer.NewDefaultNetworkHealthTracker()
+	health.RecordFailure(paths[0])
+	healthAware := applyUploadCompatibilitySelection(Options{forceSequential: true, HealthTracker: health}, selection)
+	if len(healthAware.Paths) != 2 || healthAware.Paths[0].InterfaceIndex != 2 || healthAware.Paths[1].InterfaceIndex != 1 {
+		t.Fatalf("sequential failover did not rank the cooled interface last: %#v", healthAware.Paths)
 	}
 }
 

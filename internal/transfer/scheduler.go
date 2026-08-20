@@ -43,18 +43,20 @@ type FileTransferJob struct {
 // known-size files from largest to smallest before the initial dispatch; files
 // with unknown size retain their input order after all known-size files.
 type FileSchedulerOptions struct {
-	Retries       int
-	LargestFirst  bool
-	HealthTracker *NetworkHealthTracker
-	SuccessHook   func(FileScheduleResult) error
+	Retries             int
+	LargestFirst        bool
+	WorkersPerInterface int
+	HealthTracker       *NetworkHealthTracker
+	SuccessHook         func(FileScheduleResult) error
 }
 
 // DefaultFileSchedulerOptions returns the defaults for the stable coarse-grain
-// strategy: one worker per physical interface, three retries, and large files first.
+// strategy: one connection slot per physical interface, three retries, and large files first.
 func DefaultFileSchedulerOptions() FileSchedulerOptions {
 	return FileSchedulerOptions{
-		Retries:      DefaultFileScheduleRetries,
-		LargestFirst: true,
+		Retries:             DefaultFileScheduleRetries,
+		LargestFirst:        true,
+		WorkersPerInterface: 1,
 	}
 }
 
@@ -66,6 +68,15 @@ type FileSchedulerOption func(*FileSchedulerOptions)
 func WithFileScheduleRetries(retries int) FileSchedulerOption {
 	return func(options *FileSchedulerOptions) {
 		options.Retries = retries
+	}
+}
+
+// WithFileScheduleWorkersPerInterface sets the number of independent whole-file
+// connection slots available on each physical interface. Health/cooldown remains
+// shared by every slot belonging to the same interface.
+func WithFileScheduleWorkersPerInterface(workers int) FileSchedulerOption {
+	return func(options *FileSchedulerOptions) {
+		options.WorkersPerInterface = workers
 	}
 }
 
@@ -164,12 +175,12 @@ type scheduledWorkerResult struct {
 	attempt     FileScheduleAttempt
 }
 
-// ScheduleFileDownloads downloads whole files across the supplied network
-// paths. Exactly one worker is created per physical interface path. A failed
-// file is requeued and, when more than one healthy interface is available, its
-// next attempt is assigned to a different interface. When a P8 health tracker
-// is supplied, cooling interfaces are skipped and automatically retried after
-// their cooldown expires.
+// ScheduleFileDownloads downloads whole files across the supplied physical
+// paths. WorkersPerInterface creates independent connection slots on each path;
+// all slots on one physical interface share P8 health/cooldown. A failed file is
+// requeued and, when another healthy interface is available, its next attempt
+// prefers that interface. Cooling interfaces become eligible again after their
+// cooldown expires.
 func ScheduleFileDownloads(
 	ctx context.Context,
 	paths []NetworkPath,
@@ -212,6 +223,7 @@ func scheduleFileDownloads(
 		return report, err
 	}
 	paths = cloneNetworkPaths(paths)
+	workerPaths := expandWorkerPaths(paths, options.WorkersPerInterface)
 
 	states := make([]scheduledFileState, len(jobs))
 	for i, job := range jobs {
@@ -228,11 +240,11 @@ func scheduleFileDownloads(
 	}
 	pending := initialFileQueue(states, options.LargestFirst)
 
-	taskChannels := make([]chan scheduledWorkerTask, len(paths))
-	attemptResults := make(chan scheduledWorkerResult, len(paths))
+	taskChannels := make([]chan scheduledWorkerTask, len(workerPaths))
+	attemptResults := make(chan scheduledWorkerResult, len(workerPaths))
 	var workers sync.WaitGroup
-	workers.Add(len(paths))
-	for i := range paths {
+	workers.Add(len(workerPaths))
+	for i := range workerPaths {
 		tasks := make(chan scheduledWorkerTask)
 		taskChannels[i] = tasks
 		go func(workerIndex int, workerTasks <-chan scheduledWorkerTask) {
@@ -241,8 +253,8 @@ func scheduleFileDownloads(
 		}(i, tasks)
 	}
 
-	idleWorkers := make([]int, len(paths))
-	for i := range paths {
+	idleWorkers := make([]int, len(workerPaths))
+	for i := range workerPaths {
 		idleWorkers[i] = i
 	}
 	inFlight := 0
@@ -254,7 +266,7 @@ func scheduleFileDownloads(
 			if ctx.Err() != nil {
 				cancelled = true
 			} else {
-				inFlight += dispatchFileSchedule(states, paths, &pending, &idleWorkers, taskChannels, options.HealthTracker)
+				inFlight += dispatchFileSchedule(states, workerPaths, &pending, &idleWorkers, taskChannels, options.HealthTracker)
 			}
 		}
 
@@ -265,7 +277,7 @@ func scheduleFileDownloads(
 				break
 			}
 			if len(pending) > 0 {
-				waited, waitErr := waitForNetworkHealth(ctx, options.HealthTracker, pendingFileHealthPaths(states, paths, pending))
+				waited, waitErr := waitForNetworkHealth(ctx, options.HealthTracker, pendingFileHealthPaths(states, workerPaths, pending))
 				if waitErr != nil {
 					cancelled = true
 					completed += cancelPendingFileJobs(states, pending, waitErr)
@@ -334,7 +346,14 @@ func scheduleFileDownloads(
 			completed++
 			continue
 		}
-		if isTerminalDownloadSourceError(workerResult.attempt.Err) {
+		if isTerminalDownloadSourceError(workerResult.attempt.Err) && !IsRecoverableDownloadError(workerResult.attempt.Err) {
+			state.err = workerResult.attempt.Err
+			state.done = true
+			completed++
+			continue
+		}
+		if errors.Is(workerResult.attempt.Err, ErrDownloadExceedsLimit) ||
+			(errors.Is(workerResult.attempt.Err, ErrUnexpectedDownloadStatus) && !errors.Is(workerResult.attempt.Err, ErrTransientDownloadStatus)) {
 			state.err = workerResult.attempt.Err
 			state.done = true
 			completed++
@@ -381,6 +400,9 @@ func scheduleFileDownloads(
 func (options FileSchedulerOptions) validate() error {
 	if options.Retries < 0 {
 		return errors.New("file scheduler retries must be >= 0")
+	}
+	if options.WorkersPerInterface <= 0 {
+		return errors.New("file scheduler workers per interface must be > 0")
 	}
 	return nil
 }
@@ -587,14 +609,15 @@ func findEligibleFileDispatch(states []scheduledFileState, paths []NetworkPath, 
 }
 
 func availableFilePathCount(job FileTransferJob, paths []NetworkPath, health *NetworkHealthTracker) int {
-	count := 0
+	seen := make(map[int]struct{}, len(paths))
 	for _, workerPath := range paths {
 		assigned, ok := filePathForWorker(job, workerPath)
-		if ok && health.Available(assigned) {
-			count++
+		if !ok || !health.Available(assigned) {
+			continue
 		}
+		seen[assigned.InterfaceIndex] = struct{}{}
 	}
-	return count
+	return len(seen)
 }
 
 func pendingFileHealthPaths(states []scheduledFileState, paths []NetworkPath, pending []int) []NetworkPath {

@@ -86,10 +86,11 @@ func (ft *FileTools) uploadThroughTransfer(ctx context.Context, dirID, fileName 
 		return uploadpkg.Result{}, err
 	}
 	return state.deps.uploadFile(ctx, ft.client, dirID, fileName, fileSize, file, uploadpkg.Options{
-		Interfaces:    config.Interfaces,
-		ChunkSize:     chunkSize,
-		Retries:       config.Retries,
-		Timeout:       uploadpkg.DefaultTimeout,
-		HealthTracker: health,
+		Interfaces:          config.Interfaces,
+		ChunkSize:           chunkSize,
+		Retries:             config.Retries,
+		WorkersPerInterface: config.WorkersPerInterface,
+		Timeout:             uploadpkg.DefaultTimeout,
+		HealthTracker:       health,
 	})
 }

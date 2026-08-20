@@ -11,6 +11,7 @@ import (
 var (
 	ErrorNotSupportAlist = errors.New("not support alist due to privacy risk, please use openlist: https://github.com/OpenListTeam/OpenList")
 )
+
 // cookie err
 var (
 	ErrBadCookie = errors.New("bad cookie")
@@ -47,6 +48,10 @@ var (
 
 	ErrUploadFailed = errors.New("upload failed")
 
+	// ErrUploadVerificationFailed means 115 rejected a completed upload during
+	// server-side verification and requested that the file be uploaded again.
+	ErrUploadVerificationFailed = errors.New("upload verification failed; retry upload")
+
 	ErrImportDirectory = errors.New("can not import directory")
 
 	ErrDownloadEmpty = errors.New("can not get download URL")
@@ -80,7 +85,7 @@ var (
 	ErrPickCodeIsEmpty = errors.New("empty pickcode")
 
 	ErrPickCodeIsNotExistOrHasDeleted = errors.New("pickcode is not exist or has deleted")
-	
+
 	ErrUploadSH1Invalid = errors.New("userid/filesize/target/pickcode/ invalid")
 
 	ErrUploadSigInvalid = errors.New("sig invalid")

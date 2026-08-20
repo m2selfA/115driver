@@ -1,8 +1,12 @@
 package driver
 
 import (
+	"fmt"
+	"io"
 	"net/http"
+	"os"
 	"strings"
+	"sync"
 
 	"github.com/go-resty/resty/v2"
 )
@@ -25,12 +29,16 @@ type Pan115Client struct {
 	UploadMetaInfo    *UploadMetaInfo
 	UseInternalUpload bool
 	uaHandlingDone    bool
+	debug             bool
+	debugWriter       io.Writer
+	debugMu           sync.Mutex
 }
 
 // New creates Client with customized options.
 func New(opts ...Option) *Pan115Client {
 	c := &Pan115Client{
-		Client: resty.New(),
+		Client:      resty.New(),
+		debugWriter: os.Stderr,
 	}
 
 	c.applyEmptyUAHandling()
@@ -78,11 +86,20 @@ func (c *Pan115Client) applyEmptyUAHandling() {
 		return
 	}
 
+	// Resty's built-in debug logger dumps complete headers, query strings, and
+	// bodies. 115 requests carry cookies and upload responses can carry temporary
+	// OSS credentials, so raw Resty debug output is never safe for this client.
+	// Driver debug mode uses the bounded metadata-only logger below instead.
+	c.Client.SetDebug(false)
+
 	// Hook 1: before resty's middleware — replace an explicitly empty UA
 	// (request level) or client level with the sentinel. Client headers are
 	// checked separately because they are merged into the request by
 	// parseRequestHeader after this hook runs.
 	c.Client.OnBeforeRequest(func(client *resty.Client, r *resty.Request) error {
+		// Request-level Resty debug can override the client setting, so suppress it
+		// before Resty's request logger runs as well.
+		r.Debug = false
 		if isEmptyUA(r.Header) {
 			r.Header.Set("User-Agent", sentinelEmptyUA)
 			return nil
@@ -104,6 +121,7 @@ func (c *Pan115Client) applyEmptyUAHandling() {
 		if req.Header.Get("User-Agent") == sentinelEmptyUA {
 			req.Header.Set("User-Agent", "")
 		}
+		c.logSafeDebugRequest(req)
 		return nil
 	})
 
@@ -116,6 +134,7 @@ func (c *Pan115Client) applyEmptyUAHandling() {
 			resp.Request.Header.Get("User-Agent") == sentinelEmptyUA {
 			resp.Request.Header.Set("User-Agent", "")
 		}
+		c.logSafeDebugResponse(resp)
 		return nil
 	})
 
@@ -131,6 +150,56 @@ func (c *Pan115Client) applyEmptyUAHandling() {
 func isEmptyUA(h http.Header) bool {
 	vals, exists := h["User-Agent"]
 	return exists && (len(vals) == 0 || strings.TrimSpace(vals[0]) == "")
+}
+
+// safeDebugRequestURL returns enough URL context for diagnostics without
+// exposing credentials or signed values. Query parameter names are retained,
+// but every value is redacted and URL userinfo/fragments are omitted.
+func safeDebugRequestURL(req *http.Request) string {
+	if req == nil || req.URL == nil {
+		return ""
+	}
+	u := *req.URL
+	u.User = nil
+	u.Fragment = ""
+	if u.RawQuery != "" {
+		q := u.Query()
+		for key := range q {
+			q.Set(key, "[REDACTED]")
+		}
+		u.RawQuery = q.Encode()
+	}
+	return u.String()
+}
+
+// debugf writes one metadata-only debug line. Callers must only pass values
+// that are already known to be non-sensitive; request/response bodies and
+// headers intentionally never reach this path.
+func (c *Pan115Client) debugf(format string, args ...any) {
+	if !c.debug || c.debugWriter == nil {
+		return
+	}
+	c.debugMu.Lock()
+	defer c.debugMu.Unlock()
+	_, _ = fmt.Fprintf(c.debugWriter, "115driver DEBUG "+format+"\n", args...)
+}
+
+func (c *Pan115Client) logSafeDebugRequest(req *http.Request) {
+	if req == nil {
+		return
+	}
+	c.debugf("request method=%s url=%s content_length=%d", req.Method, safeDebugRequestURL(req), req.ContentLength)
+}
+
+func (c *Pan115Client) logSafeDebugResponse(resp *resty.Response) {
+	if resp == nil {
+		return
+	}
+	contentLength := int64(-1)
+	if resp.RawResponse != nil {
+		contentLength = resp.RawResponse.ContentLength
+	}
+	c.debugf("response status=%d duration=%s content_length=%d", resp.StatusCode(), resp.Time(), contentLength)
 }
 
 // Default creates an Client with default settings.
@@ -161,7 +230,10 @@ func (c *Pan115Client) SetCookies(cs ...*http.Cookie) *Pan115Client {
 }
 
 func (c *Pan115Client) SetDebug(d bool) *Pan115Client {
-	c.Client.SetDebug(d)
+	c.debug = d
+	// Never enable Resty's raw dump: it includes cookies, signed query values,
+	// request bodies, and temporary OSS credentials returned by 115.
+	c.Client.SetDebug(false)
 	return c
 }
 

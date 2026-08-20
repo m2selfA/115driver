@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 	"sync"
@@ -89,6 +90,7 @@ func OpenTransferTreeSession(path string, spec TransferTreeSessionSpec, director
 		}
 	}
 
+	spec = canonicalTransferTreeSessionSpec(spec)
 	keyHash := transferTreeSessionKeyHash(spec)
 	now := time.Now().UTC()
 	snapshot := TransferTreeSessionSnapshot{
@@ -98,7 +100,8 @@ func OpenTransferTreeSession(path string, spec TransferTreeSessionSpec, director
 		if err := json.Unmarshal(data, &snapshot); err != nil {
 			return nil, fmt.Errorf("%w: decode %s: %v", ErrTransferTreeSession, filepath.Base(path), err)
 		}
-		if snapshot.Version != TransferTreeSessionVersion || snapshot.KeyHash != keyHash {
+		legacySpec := canonicalTransferTreeSessionSpec(snapshot.Spec)
+		if snapshot.Version != TransferTreeSessionVersion || snapshot.KeyHash != keyHash && transferTreeSessionKeyHash(legacySpec) != keyHash {
 			return nil, fmt.Errorf("%w: session belongs to a different transfer", ErrTransferTreeSession)
 		}
 	} else if !os.IsNotExist(err) {
@@ -335,6 +338,19 @@ func cleanSessionRelativePath(relative string, allowRoot bool) (string, error) {
 		return "", fmt.Errorf("%w: relative path escapes root: %q", ErrTransferTreeSession, relative)
 	}
 	return cleaned, nil
+}
+
+func canonicalTransferTreeSessionSpec(spec TransferTreeSessionSpec) TransferTreeSessionSpec {
+	if runtime.GOOS != "windows" {
+		return spec
+	}
+	switch strings.ToLower(strings.TrimSpace(spec.Direction)) {
+	case "upload":
+		spec.Source = strings.ToLower(filepath.Clean(spec.Source))
+	case "download":
+		spec.Destination = strings.ToLower(filepath.Clean(spec.Destination))
+	}
+	return spec
 }
 
 func transferTreeSessionKeyHash(spec TransferTreeSessionSpec) string {

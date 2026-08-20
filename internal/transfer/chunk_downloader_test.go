@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -93,6 +94,110 @@ func TestDownloadFileByChunksAggregatesInterfacesAndAssemblesFile(t *testing.T) 
 		t.Fatalf("caller Range header mutated: %q", headers.Get("Range"))
 	}
 	assertNoDownloadTemps(t, filepath.Dir(target), filepath.Base(target))
+}
+
+func TestDownloadFileByChunksUsesMultipleConnectionsOnOneInterface(t *testing.T) {
+	data := []byte("abcdefghijkl")
+	target := filepath.Join(t.TempDir(), "single-nic-multi.bin")
+	path := testNetworkPath(1, "10.0.0.1")
+	request := ChunkDownloadRequest{
+		URL: "https://cdn.example.invalid/file", DestinationPath: target,
+		NetworkPaths: []NetworkPath{path}, ExpectedSize: int64(len(data)), ChunkSize: 4,
+		WorkersPerInterface: 3,
+	}
+	var active atomic.Int32
+	var maxActive atomic.Int32
+	var entered atomic.Int32
+	release := make(chan struct{})
+	result, err := downloadFileByChunks(context.Background(), request, func(NetworkPath) (http.RoundTripper, error) {
+		return roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			current := active.Add(1)
+			defer active.Add(-1)
+			for {
+				prior := maxActive.Load()
+				if current <= prior || maxActive.CompareAndSwap(prior, current) {
+					break
+				}
+			}
+			if entered.Add(1) == 3 {
+				close(release)
+			}
+			select {
+			case <-release:
+			case <-time.After(time.Second):
+				return nil, errors.New("single-interface range connections did not overlap")
+			}
+			start, end := mustParseRequestRange(t, req.Header.Get("Range"))
+			return chunkHTTPResponse(req, start, end, int64(len(data)), string(data[start:end+1])), nil
+		}), nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.BytesWritten != int64(len(data)) || maxActive.Load() != 3 {
+		t.Fatalf("unexpected single-interface chunk concurrency: max=%d result=%#v", maxActive.Load(), result)
+	}
+}
+
+func TestDownloadFileByChunksTransientServerStatusRetriesWithoutCoolingInterface(t *testing.T) {
+	data := []byte("abcd")
+	target := filepath.Join(t.TempDir(), "transient-range.bin")
+	path := testNetworkPath(1, "10.0.0.1")
+	health := NewDefaultNetworkHealthTracker()
+	request := ChunkDownloadRequest{
+		URL: "https://cdn.example.invalid/file", DestinationPath: target,
+		NetworkPaths: []NetworkPath{path}, ExpectedSize: int64(len(data)), ChunkSize: 4,
+		Retries: 1, HealthTracker: health,
+	}
+	var calls atomic.Int32
+	result, err := downloadFileByChunks(context.Background(), request, func(NetworkPath) (http.RoundTripper, error) {
+		return roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			if calls.Add(1) == 1 {
+				return &http.Response{StatusCode: http.StatusTooManyRequests, Header: make(http.Header), Body: io.NopCloser(strings.NewReader("")), Request: req}, nil
+			}
+			start, end := mustParseRequestRange(t, req.Header.Get("Range"))
+			return chunkHTTPResponse(req, start, end, int64(len(data)), string(data[start:end+1])), nil
+		}), nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if calls.Load() != 2 || result.BytesWritten != int64(len(data)) {
+		t.Fatalf("transient range status was not retried: calls=%d result=%#v", calls.Load(), result)
+	}
+	if snapshot := health.Snapshot(path); snapshot.Failures != 0 {
+		t.Fatalf("HTTP 429 incorrectly cooled the interface: %#v", snapshot)
+	}
+}
+
+func TestDownloadFileByChunksInterfaceDropMovesRangesToHealthyInterface(t *testing.T) {
+	data := []byte("abcdefghijklmnop")
+	target := filepath.Join(t.TempDir(), "interface-drop.bin")
+	paths := []NetworkPath{testNetworkPath(1, "10.0.0.1"), testNetworkPath(2, "10.0.0.2")}
+	health := NewDefaultNetworkHealthTracker()
+	request := ChunkDownloadRequest{
+		URL: "https://cdn.example.invalid/file", DestinationPath: target,
+		NetworkPaths: paths, ExpectedSize: int64(len(data)), ChunkSize: 4,
+		Retries: 2, WorkersPerInterface: 2, HealthTracker: health,
+	}
+	result, err := downloadFileByChunks(context.Background(), request, func(path NetworkPath) (http.RoundTripper, error) {
+		return roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			if path.InterfaceIndex == 1 {
+				return nil, &url.Error{Op: "Get", URL: req.URL.String(), Err: &net.OpError{Op: "read", Net: "tcp", Err: errors.New("interface removed")}}
+			}
+			start, end := mustParseRequestRange(t, req.Header.Get("Range"))
+			return chunkHTTPResponse(req, start, end, int64(len(data)), string(data[start:end+1])), nil
+		}), nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.BytesWritten != int64(len(data)) || health.Snapshot(paths[0]).Failures == 0 {
+		t.Fatalf("interface drop was not recovered through the healthy NIC: result=%#v health=%#v", result, health.Snapshot(paths[0]))
+	}
+	if got, readErr := os.ReadFile(target); readErr != nil || string(got) != string(data) {
+		t.Fatalf("interface-drop output mismatch: %q err=%v", got, readErr)
+	}
 }
 
 func TestDownloadFileByChunksRetriesFailedChunkOnDifferentInterface(t *testing.T) {

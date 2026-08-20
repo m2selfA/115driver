@@ -228,19 +228,21 @@ func executeDownloadCommand(
 		for _, item := range prepared {
 			job := item.Job
 			chunkResult, chunkErr := deps.downloadChunks(ctx, transfer.ChunkDownloadRequest{
-				URL:             job.URL,
-				Header:          job.Header,
-				DestinationPath: job.DestinationPath,
-				NetworkPaths:    job.NetworkPaths,
-				ExpectedSize:    job.ExpectedSize,
-				ChunkSize:       options.ChunkSize,
-				MaxBytes:        job.MaxBytes,
-				Timeout:         job.Timeout,
-				Retries:         options.Retries,
-				HealthTracker:   health,
-				ResumeKey:       job.ResumeKey,
-				Refresh:         job.Refresh,
-				MaxRefreshes:    job.MaxRefreshes,
+				URL:                 job.URL,
+				Header:              job.Header,
+				DestinationPath:     job.DestinationPath,
+				NetworkPaths:        job.NetworkPaths,
+				ExpectedSize:        job.ExpectedSize,
+				ChunkSize:           options.ChunkSize,
+				MaxBytes:            job.MaxBytes,
+				Timeout:             job.Timeout,
+				Retries:             options.Retries,
+				RecoveryRetries:     options.Retries,
+				WorkersPerInterface: options.WorkersPerInterface,
+				HealthTracker:       health,
+				ResumeKey:           job.ResumeKey,
+				Refresh:             job.Refresh,
+				MaxRefreshes:        job.MaxRefreshes,
 			})
 			summary.ChunkResults = append(summary.ChunkResults, chunkResult)
 			if chunkErr != nil {
@@ -274,6 +276,7 @@ func executeDownloadCommand(
 
 	schedulerOptions := []transfer.FileSchedulerOption{
 		transfer.WithFileScheduleRetries(options.Retries),
+		transfer.WithFileScheduleWorkersPerInterface(options.WorkersPerInterface),
 		transfer.WithFileScheduleHealthTracker(health),
 	}
 	if treeSession != nil {
@@ -322,8 +325,8 @@ func validateDownloadCommandOptions(options downloadCommandOptions) error {
 	if strategy != "file" && strategy != "chunk" {
 		return fmt.Errorf("unsupported transfer strategy %q; use \"file\" or \"chunk\"", options.Strategy)
 	}
-	if options.WorkersPerInterface != 1 {
-		return fmt.Errorf("transfer currently requires workers_per_interface = 1, got %d", options.WorkersPerInterface)
+	if options.WorkersPerInterface <= 0 {
+		return errors.New("transfer workers per interface must be > 0")
 	}
 	if options.ChunkSize <= 0 {
 		return errors.New("transfer chunk size must be > 0")

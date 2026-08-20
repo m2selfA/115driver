@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"net"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -67,6 +66,45 @@ func TestScheduleUploadPartsUsesOneWorkerPerInterfaceAndSharedQueue(t *testing.T
 	}
 }
 
+func TestScheduleUploadPartsUsesMultipleConnectionsOnOneInterface(t *testing.T) {
+	path := testNetworkPath(1, "10.0.0.1")
+	jobs := make([]UploadPartJob, 6)
+	for i := range jobs {
+		jobs[i] = UploadPartJob{PartNumber: i + 1, Offset: int64(i * 4), Size: 4}
+	}
+	var active atomic.Int32
+	var maxActive atomic.Int32
+	var entered atomic.Int32
+	release := make(chan struct{})
+	report, err := ScheduleUploadParts(context.Background(), []NetworkPath{path}, jobs, func(ctx context.Context, _ NetworkPath, job UploadPartJob) (UploadPartResult, error) {
+		current := active.Add(1)
+		defer active.Add(-1)
+		for {
+			prior := maxActive.Load()
+			if current <= prior || maxActive.CompareAndSwap(prior, current) {
+				break
+			}
+		}
+		if entered.Add(1) == 3 {
+			close(release)
+		}
+		select {
+		case <-release:
+		case <-ctx.Done():
+			return UploadPartResult{}, ctx.Err()
+		case <-time.After(time.Second):
+			return UploadPartResult{}, errors.New("single-interface upload connections did not overlap")
+		}
+		return UploadPartResult{PartNumber: job.PartNumber, ETag: fmt.Sprintf("etag-%d", job.PartNumber), BytesUploaded: job.Size}, nil
+	}, WithUploadPartRetries(0), WithUploadPartWorkersPerInterface(3))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.SucceededCount() != len(jobs) || maxActive.Load() != 3 {
+		t.Fatalf("unexpected single-interface upload concurrency: max=%d report=%#v", maxActive.Load(), report)
+	}
+}
+
 func TestScheduleUploadPartsRetriesNetworkFailureOnDifferentInterface(t *testing.T) {
 	paths := []NetworkPath{testNetworkPath(1, "10.0.0.1"), testNetworkPath(2, "10.0.0.2")}
 	var failed atomic.Bool
@@ -125,13 +163,43 @@ func TestScheduleUploadPartsPreserveOrderRetriesBeforeLaterParts(t *testing.T) {
 	}
 }
 
-func TestScheduleUploadPartsPreserveOrderRejectsMultipleInterfaces(t *testing.T) {
+func TestScheduleUploadPartsPreserveOrderAllowsInterfaceFailover(t *testing.T) {
 	paths := []NetworkPath{testNetworkPath(1, "10.0.0.1"), testNetworkPath(2, "10.0.0.2")}
-	_, err := ScheduleUploadParts(context.Background(), paths, []UploadPartJob{{PartNumber: 1, Offset: 0, Size: 1}}, func(context.Context, NetworkPath, UploadPartJob) (UploadPartResult, error) {
-		return UploadPartResult{}, nil
-	}, WithUploadPartPreserveOrder(true))
-	if err == nil || !strings.Contains(err.Error(), "exactly one network path") {
-		t.Fatalf("expected ordered multi-interface rejection, got %v", err)
+	jobs := []UploadPartJob{{PartNumber: 1, Offset: 0, Size: 4}, {PartNumber: 2, Offset: 4, Size: 4}}
+	var mu sync.Mutex
+	var order []string
+	failed := false
+	var active atomic.Int32
+	var maxActive atomic.Int32
+	report, err := ScheduleUploadParts(context.Background(), paths, jobs, func(_ context.Context, path NetworkPath, job UploadPartJob) (UploadPartResult, error) {
+		current := active.Add(1)
+		defer active.Add(-1)
+		for {
+			prior := maxActive.Load()
+			if current <= prior || maxActive.CompareAndSwap(prior, current) {
+				break
+			}
+		}
+		mu.Lock()
+		order = append(order, fmt.Sprintf("%d@%d", job.PartNumber, path.InterfaceIndex))
+		mu.Unlock()
+		if job.PartNumber == 1 && path.InterfaceIndex == 1 && !failed {
+			failed = true
+			return UploadPartResult{}, &net.OpError{Op: "write", Net: "tcp", Err: errors.New("interface dropped")}
+		}
+		return UploadPartResult{PartNumber: job.PartNumber, ETag: fmt.Sprintf("etag-%d", job.PartNumber), BytesUploaded: job.Size}, nil
+	}, WithUploadPartRetries(1), WithUploadPartWorkersPerInterface(4), WithUploadPartPreserveOrder(true))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.SucceededCount() != 2 || maxActive.Load() != 1 {
+		t.Fatalf("sequential upload violated single in-flight rule: max=%d report=%#v", maxActive.Load(), report)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	want := []string{"1@1", "1@2", "2@2"}
+	if fmt.Sprint(order) != fmt.Sprint(want) {
+		t.Fatalf("sequential failover/order mismatch: got %v want %v", order, want)
 	}
 }
 

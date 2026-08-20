@@ -1,10 +1,13 @@
 package transfer
 
 import (
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
+	"time"
 )
 
 func TestTransferTreeSessionPersistsAndReconcilesFiles(t *testing.T) {
@@ -75,6 +78,38 @@ func TestTransferTreeSessionDownloadIdentityChangeResetsCompletion(t *testing.T)
 	}
 	if reopened.Snapshot().Files[0].Completed {
 		t.Fatal("changed remote SHA1 retained completion")
+	}
+}
+
+func TestTransferTreeSessionWindowsAcceptsLegacyPathCasing(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("Windows path identity test")
+	}
+	path := filepath.Join(t.TempDir(), "session.json")
+	legacy := TransferTreeSessionSpec{Direction: "upload", Source: `C:\\Data\\Tree`, Destination: "/remote", Strategy: "multipart"}
+	files := []TransferTreeSessionFile{{RelativePath: "a.bin", Size: 1, Completed: true}}
+	now := time.Now().UTC()
+	legacySnapshot := TransferTreeSessionSnapshot{
+		Version: TransferTreeSessionVersion,
+		KeyHash: transferTreeSessionKeyHash(legacy),
+		Spec:    legacy, CreatedAt: now, UpdatedAt: now,
+		Files: files,
+	}
+	encoded, err := json.MarshalIndent(legacySnapshot, "", "  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, encoded, 0600); err != nil {
+		t.Fatal(err)
+	}
+	current := legacy
+	current.Source = `c:\\data\\tree`
+	reopened, err := OpenTransferTreeSession(path, current, nil, files)
+	if err != nil {
+		t.Fatalf("legacy path casing should remain resumable: %v", err)
+	}
+	if !reopened.Snapshot().Files[0].Completed {
+		t.Fatal("legacy session completion was not preserved")
 	}
 }
 

@@ -172,6 +172,11 @@ func downloadFile(ctx context.Context, request FileDownloadRequest, factory tran
 			}
 			continue
 		}
+		if isTransientDownloadStatus(response.StatusCode) {
+			_ = response.Body.Close()
+			result.Refreshes = source.refreshCount()
+			return result, transientDownloadStatusError(response.StatusCode)
+		}
 
 		resuming := offset > 0
 		if resuming && response.StatusCode == http.StatusOK {

@@ -29,7 +29,7 @@ func resolveUploadPaths(ctx context.Context, selector, probeURL string) (pathSel
 			return pathSelection{}, fmt.Errorf("auto-detect OSS network interfaces: %w", err)
 		}
 		if len(discovery.Paths) == 0 {
-			return pathSelection{}, errors.New("no network interface can reach the OSS upload endpoint")
+			return pathSelection{}, fmt.Errorf("%w: no network interface can reach the OSS upload endpoint", transfer.ErrNetworkPathFailure)
 		}
 		return pathSelection{Paths: discovery.Paths, Warning: discovery.EnumerationError}, nil
 	}
@@ -56,9 +56,36 @@ func resolveUploadPaths(ctx context.Context, selector, probeURL string) (pathSel
 	}
 	workers := transfer.SelectReachableNetworkPaths(probes)
 	if len(workers) == 0 {
-		return pathSelection{}, errors.New("none of the selected interfaces can reach the OSS upload endpoint")
+		return pathSelection{}, fmt.Errorf("%w: none of the selected interfaces can reach the OSS upload endpoint", transfer.ErrNetworkPathFailure)
 	}
 	return pathSelection{Paths: workers, Warning: enumerationErr}, nil
+}
+
+func applyUploadCompatibilitySelection(options Options, selection pathSelection) pathSelection {
+	if !options.forceSequential || len(selection.Paths) <= 1 {
+		return selection
+	}
+	// Sequential compatibility constrains part ordering, not the lifetime of a
+	// transfer to one physical NIC. Retain every candidate so a failed ordered
+	// part can retry on another path, while putting healthy paths first.
+	selection.Paths = append([]transfer.NetworkPath(nil), selection.Paths...)
+	if options.HealthTracker == nil {
+		return selection
+	}
+	sort.SliceStable(selection.Paths, func(i, j int) bool {
+		leftAvailable := options.HealthTracker.Available(selection.Paths[i])
+		rightAvailable := options.HealthTracker.Available(selection.Paths[j])
+		if leftAvailable != rightAvailable {
+			return leftAvailable
+		}
+		leftScore := options.HealthTracker.Score(selection.Paths[i])
+		rightScore := options.HealthTracker.Score(selection.Paths[j])
+		if leftScore != rightScore {
+			return leftScore > rightScore
+		}
+		return selection.Paths[i].InterfaceIndex < selection.Paths[j].InterfaceIndex
+	})
+	return selection
 }
 
 func selectManualPaths(paths []transfer.NetworkPath, selector string) ([]transfer.NetworkPath, error) {

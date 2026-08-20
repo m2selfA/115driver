@@ -71,6 +71,27 @@ func TestDownloadFileReplacesExistingDestinationAfterCompleteSuccess(t *testing.
 	assertNoDownloadTemps(t, dir, filepath.Base(target))
 }
 
+func TestDownloadFileClassifiesTransientHTTPStatusWithoutPathFailure(t *testing.T) {
+	target := filepath.Join(t.TempDir(), "transient.bin")
+	request := testFileDownloadRequest(target, 3)
+	_, err := downloadFile(context.Background(), request, func(NetworkPath) (http.RoundTripper, error) {
+		return roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			return &http.Response{
+				StatusCode: http.StatusServiceUnavailable,
+				Header:     make(http.Header),
+				Body:       io.NopCloser(strings.NewReader("")),
+				Request:    req,
+			}, nil
+		}), nil
+	})
+	if !errors.Is(err, ErrTransientDownloadStatus) || !errors.Is(err, ErrUnexpectedDownloadStatus) {
+		t.Fatalf("expected typed transient HTTP error, got %v", err)
+	}
+	if errors.Is(err, ErrNetworkPathFailure) {
+		t.Fatalf("server HTTP status incorrectly penalized the physical interface: %v", err)
+	}
+}
+
 func TestDownloadFilePreservesExistingDestinationOnHTTPFailure(t *testing.T) {
 	target := writeExistingDownloadTarget(t)
 	request := testFileDownloadRequest(target, 3)

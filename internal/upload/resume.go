@@ -40,6 +40,10 @@ type uploadResumeState struct {
 	UploadID   string             `json:"upload_id,omitempty"`
 	ChunkSize  int64              `json:"chunk_size,omitempty"`
 	Sequential bool               `json:"sequential,omitempty"`
+	// ForceSequential is latched after 115 rejects a parallel multipart
+	// callback verification. It survives process restarts so recovery does not
+	// repeat a known-incompatible parallel completion path.
+	ForceSequential bool `json:"force_sequential,omitempty"`
 }
 
 func loadUploadResume(path, dirID, fileName string, fileSize int64, sha1 string) (*uploadResumeState, error) {

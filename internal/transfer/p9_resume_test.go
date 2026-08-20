@@ -240,6 +240,80 @@ func TestDownloadFileByChunksResumesOnlyIncompleteChunksAcrossCalls(t *testing.T
 	assertResumeArtifactsRemoved(t, target)
 }
 
+func TestDownloadFileByChunksRecoveryContinuesPersistedIncompleteChunks(t *testing.T) {
+	data := []byte("abcdefgh")
+	target := filepath.Join(t.TempDir(), "same-process-recovery.bin")
+	path := testNetworkPath(1, "10.0.0.1")
+	request := ChunkDownloadRequest{
+		URL: "https://cdn.example.invalid/file", DestinationPath: target,
+		NetworkPaths: []NetworkPath{path}, ExpectedSize: int64(len(data)), ChunkSize: 4,
+		Retries: 0, RecoveryRetries: 1, ResumeKey: "pick-same-process-recovery",
+	}
+	var failed atomic.Bool
+	var firstChunkRequests atomic.Int32
+	var secondChunkRequests atomic.Int32
+	result, err := downloadFileByChunksWithRecovery(context.Background(), request, func(NetworkPath) (http.RoundTripper, error) {
+		return roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			start, end := mustParseRequestRange(t, req.Header.Get("Range"))
+			if start == 0 {
+				firstChunkRequests.Add(1)
+			} else {
+				secondChunkRequests.Add(1)
+				if failed.CompareAndSwap(false, true) {
+					return nil, &url.Error{Op: "Get", URL: req.URL.String(), Err: errors.New("interface disappeared")}
+				}
+			}
+			return chunkHTTPResponse(req, start, end, int64(len(data)), string(data[start:end+1])), nil
+		}), nil
+	}, func(context.Context, int) error { return nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.BytesWritten != int64(len(data)) || firstChunkRequests.Load() != 1 || secondChunkRequests.Load() != 2 {
+		t.Fatalf("outer recovery did not resume only missing chunks: first=%d second=%d result=%#v", firstChunkRequests.Load(), secondChunkRequests.Load(), result)
+	}
+	if got, readErr := os.ReadFile(target); readErr != nil || string(got) != string(data) {
+		t.Fatalf("recovered chunk output mismatch: %q err=%v", got, readErr)
+	}
+}
+
+func TestDownloadFileByChunksRecoveryKeepsRefreshedSourceAndBudget(t *testing.T) {
+	data := []byte("abcdefgh")
+	target := filepath.Join(t.TempDir(), "recovery-refresh.bin")
+	path := testNetworkPath(1, "10.0.0.1")
+	request := ChunkDownloadRequest{
+		URL: "https://cdn.example.invalid/file?token=old", DestinationPath: target,
+		NetworkPaths: []NetworkPath{path}, ExpectedSize: int64(len(data)), ChunkSize: 4,
+		Retries: 0, RecoveryRetries: 1, ResumeKey: "pick-recovery-refresh", MaxRefreshes: 1,
+	}
+	var refreshCalls atomic.Int32
+	request.Refresh = func(context.Context) (DownloadSource, error) {
+		refreshCalls.Add(1)
+		return DownloadSource{URL: "https://cdn.example.invalid/file?token=new"}, nil
+	}
+	var failed atomic.Bool
+	var oldRequests atomic.Int32
+	result, err := downloadFileByChunksWithRecovery(context.Background(), request, func(NetworkPath) (http.RoundTripper, error) {
+		return roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			if req.URL.Query().Get("token") == "old" {
+				oldRequests.Add(1)
+				return p9StatusResponse(req, http.StatusForbidden), nil
+			}
+			start, end := mustParseRequestRange(t, req.Header.Get("Range"))
+			if start > 0 && failed.CompareAndSwap(false, true) {
+				return nil, &url.Error{Op: "Get", URL: req.URL.String(), Err: errors.New("interface dropped after refresh")}
+			}
+			return chunkHTTPResponse(req, start, end, int64(len(data)), string(data[start:end+1])), nil
+		}), nil
+	}, func(context.Context, int) error { return nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.BytesWritten != int64(len(data)) || result.Refreshes != 1 || refreshCalls.Load() != 1 || oldRequests.Load() != 1 {
+		t.Fatalf("outer recovery reset refreshed source state: result=%#v refreshes=%d old=%d", result, refreshCalls.Load(), oldRequests.Load())
+	}
+}
+
 func TestDownloadFileByChunksRefreshesExpiredSourceOnceAcrossWorkers(t *testing.T) {
 	data := []byte("abcdefgh")
 	paths := []NetworkPath{testNetworkPath(1, "10.0.0.1"), testNetworkPath(2, "10.0.0.2")}

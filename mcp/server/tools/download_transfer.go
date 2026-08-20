@@ -63,8 +63,8 @@ func (config DownloadTransferConfig) Validate() error {
 	if strategy != "file" && strategy != "chunk" {
 		return fmt.Errorf("unsupported transfer strategy %q; use %q or %q", config.Strategy, "file", "chunk")
 	}
-	if config.WorkersPerInterface != 1 {
-		return fmt.Errorf("transfer currently requires workers_per_interface = 1, got %d", config.WorkersPerInterface)
+	if config.WorkersPerInterface <= 0 {
+		return errors.New("transfer.workers_per_interface must be > 0")
 	}
 	if config.ProbeCacheTTL <= 0 {
 		return errors.New("transfer.probe_cache_ttl must be > 0")
@@ -316,19 +316,21 @@ func (ft *FileTools) downloadThroughTransfer(ctx context.Context, info *driver.D
 			return transfer.FileDownloadResult{}, err
 		}
 		chunkResult, chunkErr := state.deps.downloadChunks(ctx, transfer.ChunkDownloadRequest{
-			URL:             info.Url.Url,
-			Header:          info.Header,
-			DestinationPath: localPath,
-			NetworkPaths:    selectedPaths,
-			ExpectedSize:    expectedSize,
-			ChunkSize:       chunkSize,
-			MaxBytes:        ft.downloadMaxBytes,
-			Timeout:         ft.downloadTimeout,
-			Retries:         config.Retries,
-			HealthTracker:   health,
-			ResumeKey:       resumeKey,
-			Refresh:         refresh,
-			MaxRefreshes:    config.URLRefreshes,
+			URL:                 info.Url.Url,
+			Header:              info.Header,
+			DestinationPath:     localPath,
+			NetworkPaths:        selectedPaths,
+			ExpectedSize:        expectedSize,
+			ChunkSize:           chunkSize,
+			MaxBytes:            ft.downloadMaxBytes,
+			Timeout:             ft.downloadTimeout,
+			Retries:             config.Retries,
+			RecoveryRetries:     config.Retries,
+			WorkersPerInterface: config.WorkersPerInterface,
+			HealthTracker:       health,
+			ResumeKey:           resumeKey,
+			Refresh:             refresh,
+			MaxRefreshes:        config.URLRefreshes,
 		})
 		fileResult := transfer.FileDownloadResult{
 			DestinationPath: localPath,
@@ -361,7 +363,7 @@ func (ft *FileTools) downloadThroughTransfer(ctx context.Context, info *driver.D
 		ResumeKey:       resumeKey,
 		Refresh:         refresh,
 		MaxRefreshes:    config.URLRefreshes,
-	}}, transfer.WithFileScheduleRetries(config.Retries), transfer.WithFileScheduleHealthTracker(health))
+	}}, transfer.WithFileScheduleRetries(config.Retries), transfer.WithFileScheduleWorkersPerInterface(config.WorkersPerInterface), transfer.WithFileScheduleHealthTracker(health))
 	if len(report.Results) != 1 {
 		if scheduleErr != nil {
 			return transfer.FileDownloadResult{}, scheduleErr

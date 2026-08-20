@@ -303,15 +303,29 @@ func initiateMultipart(ctx context.Context, pool *ossBucketPool, paths []transfe
 	return oss.InitiateMultipartUploadResult{}, errors.Join(errs...)
 }
 
-func multipartCallbackParams(params *driver.UploadOSSParams, sequential bool) driver.UploadOSSParams {
+func uploadCallbackRequiresSequentialSHA1(params *driver.UploadOSSParams) bool {
+	return params != nil && strings.Contains(params.Callback.Callback, "${sha1}")
+}
+
+func requireSequentialUploadCompatibility(options *Options, params *driver.UploadOSSParams) bool {
+	if options == nil || !uploadCallbackRequiresSequentialSHA1(params) {
+		return false
+	}
+	options.forceSequential = true
+	if options.Compatibility != nil {
+		options.Compatibility.RequireSequential()
+	}
+	return true
+}
+
+func multipartCallbackParams(params *driver.UploadOSSParams, _ bool) driver.UploadOSSParams {
 	if params == nil {
 		return driver.UploadOSSParams{}
 	}
-	clone := *params
-	if !sequential {
-		clone.Callback.Callback = strings.ReplaceAll(clone.Callback.Callback, "${sha1}", clone.SHA1)
-	}
-	return clone
+	// Callback payloads are protocol data supplied by 115. Keep them opaque;
+	// when ${sha1} is present the caller must use OSS sequential SHA1 context
+	// rather than rewriting the callback client-side.
+	return *params
 }
 
 func completeMultipart(ctx context.Context, pool *ossBucketPool, paths []transfer.NetworkPath, imur oss.InitiateMultipartUploadResult, parts []oss.UploadPart, params *driver.UploadOSSParams, sequential bool) ([]byte, error) {

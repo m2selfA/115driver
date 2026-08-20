@@ -1,10 +1,12 @@
 package driver
 
 import (
+	"bytes"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strings"
 	"testing"
 
 	"github.com/go-resty/resty/v2"
@@ -154,6 +156,73 @@ func TestEmptyUAHandling(t *testing.T) {
 		}
 		assertNoUA(t, tr.wireUAs, *serverUAs)
 	})
+}
+
+func TestSafeDebugLoggingDoesNotExposeCredentials(t *testing.T) {
+	const (
+		querySecret         = "query-secret-value"
+		cookieSecret        = "cookie-secret-value"
+		authorizationSecret = "authorization-secret-value"
+		ossTokenSecret      = "oss-token-secret-value"
+		requestBodySecret   = "request-body-secret-value"
+		responseBodySecret  = "response-body-secret-value"
+		responseCookie      = "response-cookie-secret-value"
+	)
+
+	var gotQuery, gotCookie, gotAuthorization, gotOSSToken, gotBody string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotQuery = r.URL.Query().Get("k_ec")
+		gotCookie = r.Header.Get("Cookie")
+		gotAuthorization = r.Header.Get("Authorization")
+		gotOSSToken = r.Header.Get("X-Oss-Security-Token")
+		body, _ := io.ReadAll(r.Body)
+		gotBody = string(body)
+		w.Header().Set("Set-Cookie", "session="+responseCookie)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"AccessKeySecret":"` + responseBodySecret + `","SecurityToken":"` + ossTokenSecret + `"}`))
+	}))
+	defer server.Close()
+
+	var logs bytes.Buffer
+	client := New()
+	client.debugWriter = &logs
+	client.SetDebug(true)
+	resp, err := client.NewRequest().
+		SetDebug(true).
+		SetHeader("Cookie", "session="+cookieSecret).
+		SetHeader("Authorization", "Bearer "+authorizationSecret).
+		SetHeader("X-Oss-Security-Token", ossTokenSecret).
+		SetBody(`{"password":"` + requestBodySecret + `"}`).
+		Post(server.URL + "/upload?k_ec=" + url.QueryEscape(querySecret) + "&plain=visible")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if gotQuery != querySecret || gotCookie != "session="+cookieSecret || gotAuthorization != "Bearer "+authorizationSecret || gotOSSToken != ossTokenSecret || !strings.Contains(gotBody, requestBodySecret) {
+		t.Fatalf("debug redaction changed wire request: query=%q cookie=%q auth=%q token=%q body=%q", gotQuery, gotCookie, gotAuthorization, gotOSSToken, gotBody)
+	}
+	if client.Client.Debug {
+		t.Fatal("raw Resty client debug must remain disabled")
+	}
+	if resp.Request.Debug {
+		t.Fatal("request-level Resty debug must be disabled before logging")
+	}
+
+	logText := logs.String()
+	for _, secret := range []string{querySecret, cookieSecret, authorizationSecret, ossTokenSecret, requestBodySecret, responseBodySecret, responseCookie} {
+		if strings.Contains(logText, secret) {
+			t.Fatalf("debug log leaked secret %q:\n%s", secret, logText)
+		}
+	}
+	for _, want := range []string{
+		"115driver DEBUG request method=POST",
+		"/upload?k_ec=%5BREDACTED%5D&plain=%5BREDACTED%5D",
+		"115driver DEBUG response status=200",
+	} {
+		if !strings.Contains(logText, want) {
+			t.Fatalf("debug log missing %q:\n%s", want, logText)
+		}
+	}
 }
 
 // TestDownloadWithUA_EmptyUA_SendsNoUA exercises the real DownloadWithUA call

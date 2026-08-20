@@ -22,22 +22,28 @@ var (
 )
 
 // ChunkDownloadRequest describes one file split into byte ranges and downloaded
-// concurrently across multiple physical interfaces. ExpectedSize must be known.
-// Retries is the number of retries allowed for each chunk after its first attempt.
+// concurrently across one or more physical interfaces. WorkersPerInterface sets
+// independent Range connection slots per interface. Retries applies inside one
+// chunk scheduling pass; RecoveryRetries reopens the persisted chunk state and
+// continues missing ranges after a recoverable pass-level failure.
 type ChunkDownloadRequest struct {
-	URL             string
-	Header          http.Header
-	DestinationPath string
-	NetworkPaths    []NetworkPath
-	ExpectedSize    int64
-	ChunkSize       int64
-	MaxBytes        int64
-	Timeout         time.Duration
-	Retries         int
-	HealthTracker   *NetworkHealthTracker
-	ResumeKey       string
-	Refresh         DownloadSourceRefreshFunc
-	MaxRefreshes    int
+	URL                 string
+	Header              http.Header
+	DestinationPath     string
+	NetworkPaths        []NetworkPath
+	ExpectedSize        int64
+	ChunkSize           int64
+	MaxBytes            int64
+	Timeout             time.Duration
+	Retries             int
+	RecoveryRetries     int
+	WorkersPerInterface int
+	HealthTracker       *NetworkHealthTracker
+	ResumeKey           string
+	Refresh             DownloadSourceRefreshFunc
+	MaxRefreshes        int
+
+	source *downloadSourceState
 }
 
 // ChunkDownloadAttempt records one range request. Signed URLs and request
@@ -95,13 +101,14 @@ type chunkWorkerResult struct {
 }
 
 // DownloadFileByChunks downloads a known-size file with HTTP Range requests.
-// Exactly one worker is created for each supplied physical interface. The file
-// is assembled in a same-directory temporary file and replaces the destination
-// only after every range has succeeded.
+// It creates the requested number of connection slots per physical interface,
+// sharing health state across slots. The file is assembled in a same-directory
+// resumable temporary file and replaces the destination only after every range
+// has succeeded.
 func DownloadFileByChunks(ctx context.Context, request ChunkDownloadRequest) (ChunkDownloadResult, error) {
-	return downloadFileByChunks(ctx, request, func(path NetworkPath) (http.RoundTripper, error) {
+	return downloadFileByChunksWithRecovery(ctx, request, func(path NetworkPath) (http.RoundTripper, error) {
 		return NewTransport(path)
-	})
+	}, waitDownloadRecoveryBackoff)
 }
 
 func (request ChunkDownloadRequest) validate() error {
@@ -122,6 +129,12 @@ func (request ChunkDownloadRequest) validate() error {
 	}
 	if request.Retries < 0 {
 		return errors.New("chunk download retries must be >= 0")
+	}
+	if request.RecoveryRetries < 0 {
+		return errors.New("chunk download recovery retries must be >= 0")
+	}
+	if request.WorkersPerInterface <= 0 {
+		return errors.New("chunk download workers per interface must be > 0")
 	}
 	if request.MaxRefreshes < 0 {
 		return errors.New("chunk download URL refresh count must be >= 0")
@@ -146,6 +159,7 @@ func (request ChunkDownloadRequest) validate() error {
 }
 
 func downloadFileByChunks(ctx context.Context, request ChunkDownloadRequest, factory transportFactory) (ChunkDownloadResult, error) {
+	request.WorkersPerInterface = normalizeWorkersPerInterface(request.WorkersPerInterface)
 	started := time.Now()
 	result := ChunkDownloadResult{
 		DestinationPath: request.DestinationPath,
@@ -154,15 +168,20 @@ func downloadFileByChunks(ctx context.Context, request ChunkDownloadRequest, fac
 	if err := request.validate(); err != nil {
 		return result, err
 	}
+	workerPaths := expandWorkerPaths(request.NetworkPaths, request.WorkersPerInterface)
 	if ctx == nil {
 		ctx = context.Background()
 	}
 	if err := ctx.Err(); err != nil {
 		return result, err
 	}
-	source, err := newDownloadSourceState(DownloadSource{URL: request.URL, Header: request.Header}, request.Refresh, request.MaxRefreshes)
-	if err != nil {
-		return result, err
+	source := request.source
+	if source == nil {
+		var err error
+		source, err = newDownloadSourceState(DownloadSource{URL: request.URL, Header: request.Header}, request.Refresh, request.MaxRefreshes)
+		if err != nil {
+			return result, err
+		}
 	}
 	chunks := buildByteChunks(request.ExpectedSize, request.ChunkSize)
 	result.ChunkCount = len(chunks)
@@ -212,14 +231,14 @@ func downloadFileByChunks(ctx context.Context, request ChunkDownloadRequest, fac
 	workerCtx, cancelWorkers := context.WithCancel(workerCtx)
 	defer cancelWorkers()
 
-	clients := make([]*http.Client, len(request.NetworkPaths))
-	closers := make([]interface{ CloseIdleConnections() }, 0, len(request.NetworkPaths))
+	clients := make([]*http.Client, len(workerPaths))
+	closers := make([]interface{ CloseIdleConnections() }, 0, len(workerPaths))
 	defer func() {
 		for _, closer := range closers {
 			closer.CloseIdleConnections()
 		}
 	}()
-	for i, path := range request.NetworkPaths {
+	for i, path := range workerPaths {
 		transport, err := factory(path)
 		if err != nil {
 			return result, fmt.Errorf("create bound chunk transport for %s: %w", path, err)
@@ -230,11 +249,11 @@ func downloadFileByChunks(ctx context.Context, request ChunkDownloadRequest, fac
 		clients[i] = &http.Client{Transport: transport}
 	}
 
-	taskChannels := make([]chan chunkWorkerTask, len(request.NetworkPaths))
-	attemptResults := make(chan chunkWorkerResult, len(request.NetworkPaths))
+	taskChannels := make([]chan chunkWorkerTask, len(workerPaths))
+	attemptResults := make(chan chunkWorkerResult, len(workerPaths))
 	var workers sync.WaitGroup
-	workers.Add(len(request.NetworkPaths))
-	for i, path := range request.NetworkPaths {
+	workers.Add(len(workerPaths))
+	for i, path := range workerPaths {
 		tasks := make(chan chunkWorkerTask)
 		taskChannels[i] = tasks
 		go func(workerIndex int, workerPath NetworkPath, client *http.Client, workerTasks <-chan chunkWorkerTask) {
@@ -246,7 +265,7 @@ func downloadFileByChunks(ctx context.Context, request ChunkDownloadRequest, fac
 		}(i, path, clients[i], tasks)
 	}
 
-	idleWorkers := make([]int, len(request.NetworkPaths))
+	idleWorkers := make([]int, len(workerPaths))
 	for i := range idleWorkers {
 		idleWorkers[i] = i
 	}
@@ -259,7 +278,7 @@ func downloadFileByChunks(ctx context.Context, request ChunkDownloadRequest, fac
 				terminalErr = err
 				cancelWorkers()
 			} else {
-				inFlight += dispatchChunkTasks(states, request.NetworkPaths, &pending, &idleWorkers, taskChannels, request.HealthTracker)
+				inFlight += dispatchChunkTasks(states, workerPaths, &pending, &idleWorkers, taskChannels, request.HealthTracker)
 			}
 		}
 
@@ -404,12 +423,7 @@ func dispatchChunkTasks(states []chunkState, paths []NetworkPath, pending *[]int
 
 func findEligibleChunkDispatch(states []chunkState, paths []NetworkPath, pending, idleWorkers []int, health *NetworkHealthTracker) (int, int) {
 	bestWorkerPos, bestJobPos, bestScore := -1, -1, -1
-	availablePathCount := 0
-	for _, path := range paths {
-		if health.Available(path) {
-			availablePathCount++
-		}
-	}
+	availablePathCount := availablePhysicalInterfaceCount(paths, health)
 	for workerPos, workerIndex := range idleWorkers {
 		path := paths[workerIndex]
 		if !health.Available(path) {
@@ -468,6 +482,11 @@ func downloadChunkRange(ctx context.Context, client *http.Client, source *downlo
 				return attempt
 			}
 			continue
+		}
+		if isTransientDownloadStatus(response.StatusCode) {
+			_ = response.Body.Close()
+			attempt.Err = transientDownloadStatusError(response.StatusCode)
+			return attempt
 		}
 		if response.StatusCode != http.StatusPartialContent {
 			_ = response.Body.Close()

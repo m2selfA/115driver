@@ -5,9 +5,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"sort"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/SheltonZhu/115driver/internal/transfer"
@@ -20,10 +22,150 @@ import (
 // upload in a later process. STS credentials are always fetched fresh and are
 // never written to disk.
 func UploadFile(ctx context.Context, client *driver.Pan115Client, dirID, fileName string, fileSize int64, file *os.File, options Options) (Result, error) {
-	if strings.TrimSpace(options.ResumePath) == "" {
-		return uploadFileWithoutResume(ctx, client, dirID, fileName, fileSize, file, options)
+	if ctx == nil {
+		ctx = context.Background()
 	}
-	return uploadFileResumable(ctx, client, dirID, fileName, fileSize, file, options)
+	retries := options.Retries
+	if retries < 0 {
+		retries = 0
+	}
+	if options.Compatibility == nil {
+		options.Compatibility = NewUploadCompatibilityState()
+	}
+	if options.Progress != nil {
+		options.Progress("Preparing upload...")
+	}
+	options.reportBytes(0, fileSize)
+	return runUploadWithRecovery(ctx, retries, options, fileSize, func(attempt int) (Result, error) {
+		if attempt > 0 && file != nil {
+			if _, err := file.Seek(0, io.SeekStart); err != nil {
+				return Result{}, fmt.Errorf("seek upload file before recovery retry: %w", err)
+			}
+		}
+		attemptOptions := options
+		attemptOptions.forceSequential = options.Compatibility.SequentialRequired()
+		var result Result
+		var err error
+		if strings.TrimSpace(options.ResumePath) == "" {
+			result, err = uploadFileWithoutResume(ctx, client, dirID, fileName, fileSize, file, attemptOptions)
+		} else {
+			result, err = uploadFileResumable(ctx, client, dirID, fileName, fileSize, file, attemptOptions)
+		}
+		if isUploadVerificationFailure(err) {
+			options.Compatibility.RequireSequential()
+		}
+		return result, err
+	}, waitUploadRecoveryBackoff)
+}
+
+type uploadRecoveryAttempt func(attempt int) (Result, error)
+type uploadRecoveryWait func(context.Context, int) error
+
+func runUploadWithRecovery(ctx context.Context, retries int, options Options, fileSize int64, attempt uploadRecoveryAttempt, wait uploadRecoveryWait) (Result, error) {
+	var lastResult Result
+	for attemptIndex := 0; ; attemptIndex++ {
+		result, err := attempt(attemptIndex)
+		lastResult = result
+		if err == nil {
+			return result, nil
+		}
+		if ctx.Err() != nil {
+			return result, errors.Join(err, ctx.Err())
+		}
+		if attemptIndex >= retries || !isRecoverableUploadFailure(err) {
+			return result, err
+		}
+		retryNumber := attemptIndex + 1
+		if options.Progress != nil {
+			mode := ""
+			if isUploadVerificationFailure(err) {
+				mode = " in sequential compatibility mode with interface failover"
+			}
+			options.Progress(fmt.Sprintf("Recovering upload; retry %d/%d%s after: %s", retryNumber, retries, mode, compactUploadRecoveryError(err)))
+		}
+		options.reportBytes(0, fileSize)
+		if wait != nil {
+			if waitErr := wait(ctx, retryNumber); waitErr != nil {
+				return lastResult, errors.Join(err, waitErr)
+			}
+		}
+	}
+}
+
+func waitUploadRecoveryBackoff(ctx context.Context, retryNumber int) error {
+	if retryNumber < 1 {
+		retryNumber = 1
+	}
+	shift := retryNumber - 1
+	if shift > 3 {
+		shift = 3
+	}
+	delay := time.Second * time.Duration(1<<shift)
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
+}
+
+func IsRecoverableError(err error) bool {
+	return isRecoverableUploadFailure(err)
+}
+
+func isRecoverableUploadFailure(err error) bool {
+	if err == nil || errors.Is(err, context.Canceled) {
+		return false
+	}
+	if isUploadVerificationFailure(err) || errors.Is(err, driver.ErrUploadFailed) ||
+		errors.Is(err, transfer.ErrNetworkPathFailure) || errors.Is(err, transfer.ErrUploadPartScheduleIncomplete) || errors.Is(err, ErrUploadMultipartGone) ||
+		errors.Is(err, context.DeadlineExceeded) || isOSSAuthError(err) || isOSSNoSuchUpload(err) {
+		return true
+	}
+	var networkErr net.Error
+	if errors.As(err, &networkErr) {
+		return true
+	}
+	if status := ossServiceStatus(err); status == 408 || status == 429 || status >= 500 {
+		return true
+	}
+	return false
+}
+
+func isUploadVerificationFailure(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, driver.ErrUploadVerificationFailed) {
+		return true
+	}
+	message := err.Error()
+	return strings.Contains(message, `"code":10002`) ||
+		(strings.Contains(message, "校验文件失败") && strings.Contains(message, "重新上传"))
+}
+
+func ossServiceStatus(err error) int {
+	var serviceError oss.ServiceError
+	if errors.As(err, &serviceError) {
+		return serviceError.StatusCode
+	}
+	var serviceErrorPtr *oss.ServiceError
+	if errors.As(err, &serviceErrorPtr) && serviceErrorPtr != nil {
+		return serviceErrorPtr.StatusCode
+	}
+	return 0
+}
+
+func compactUploadRecoveryError(err error) string {
+	message := strings.Join(strings.Fields(err.Error()), " ")
+	const maxRunes = 120
+	runes := []rune(message)
+	if len(runes) <= maxRunes {
+		return message
+	}
+	return string(runes[:maxRunes-1]) + "…"
 }
 
 func uploadFileResumable(ctx context.Context, client *driver.Pan115Client, dirID, fileName string, fileSize int64, file *os.File, options Options) (Result, error) {
@@ -79,19 +221,30 @@ func uploadFileResumable(ctx context.Context, client *driver.Pan115Client, dirID
 		return result, err
 	}
 	if state != nil {
-		present, checkErr := uploadTargetAlreadyPresent(client, dirID, fileName, fileSize, digest.QuickID)
-		if checkErr != nil {
-			return result, fmt.Errorf("verify resumable upload target: %w", checkErr)
-		}
-		if present {
-			state.Phase = uploadResumePhaseCompleted
-			if err := saveUploadResume(options.ResumePath, *state); err != nil {
-				return result, err
+		if state.ForceSequential {
+			options.forceSequential = true
+			if options.Compatibility != nil {
+				options.Compatibility.RequireSequential()
 			}
-			result.Resumed = true
-			result.BytesUploaded = fileSize
-			result.Duration = time.Since(started)
-			return result, nil
+		}
+		// After a 115 verification rejection, do not accept the old target as a
+		// shortcut while the state is prepared for a forced clean re-upload.
+		if !(state.ForceSequential && state.Phase == uploadResumePhasePrepared) {
+			present, checkErr := uploadTargetAlreadyPresent(client, dirID, fileName, fileSize, digest.QuickID)
+			if checkErr != nil {
+				return result, fmt.Errorf("verify resumable upload target: %w", checkErr)
+			}
+			if present {
+				state.Phase = uploadResumePhaseCompleted
+				if err := saveUploadResume(options.ResumePath, *state); err != nil {
+					return result, err
+				}
+				result.Resumed = true
+				options.reportBytes(fileSize, fileSize)
+				result.BytesUploaded = fileSize
+				result.Duration = time.Since(started)
+				return result, nil
+			}
 		}
 		if state.Phase == uploadResumePhaseCompleted {
 			resetUploadResumeToPrepared(state)
@@ -132,6 +285,7 @@ func uploadFileResumable(ctx context.Context, client *driver.Pan115Client, dirID
 		if err := saveUploadResume(options.ResumePath, *state); err != nil {
 			return result, err
 		}
+		options.reportBytes(fileSize, fileSize)
 		result.Rapid = true
 		result.BytesUploaded = fileSize
 		result.Duration = time.Since(started)
@@ -145,6 +299,7 @@ func uploadFileResumable(ctx context.Context, client *driver.Pan115Client, dirID
 	if !strings.EqualFold(params.SHA1, digest.QuickID) {
 		return result, errors.New("115 upload initialization returned a different file SHA1")
 	}
+	requireSequentialUploadCompatibility(&options, &params)
 	endpoint := client.GetOSSEndpoint(client.UseInternalUpload)
 	selection, err := resolveUploadPathsForParams(ctx, options, endpoint, params)
 	if err != nil {
@@ -164,6 +319,7 @@ func uploadFileResumable(ctx context.Context, client *driver.Pan115Client, dirID
 		if err := client.CheckUploadStatus(dirID, params.SHA1); err != nil {
 			return result, err
 		}
+		options.reportBytes(fileSize, fileSize)
 		state.Phase = uploadResumePhaseCompleted
 		if err := saveUploadResume(options.ResumePath, *state); err != nil {
 			return result, err
@@ -177,7 +333,7 @@ func uploadFileResumable(ctx context.Context, client *driver.Pan115Client, dirID
 	if err != nil {
 		return result, err
 	}
-	sequential := len(selection.Paths) == 1
+	sequential := options.forceSequential
 	pool := newOSSBucketPool(client, endpoint, params.Bucket)
 	defer pool.close()
 	imur, err := initiateMultipart(ctx, pool, selection.Paths, params.Object, sequential)
@@ -196,13 +352,19 @@ func resumeExistingMultipart(ctx context.Context, client *driver.Pan115Client, d
 	if strings.TrimSpace(state.Endpoint) == "" || strings.TrimSpace(state.Params.Bucket) == "" || strings.TrimSpace(state.Params.Object) == "" || strings.TrimSpace(state.UploadID) == "" || state.ChunkSize < MinPartSize {
 		return result, fmt.Errorf("%w: multipart state is incomplete", ErrUploadResumeState)
 	}
+	if migrateParallelSHA1ResumeToSequential(&options, state) {
+		if saveErr := saveUploadResume(options.ResumePath, *state); saveErr != nil {
+			return result, saveErr
+		}
+		if _, seekErr := file.Seek(0, io.SeekStart); seekErr != nil {
+			return result, seekErr
+		}
+		return uploadFileResumable(ctx, client, dirID, fileName, fileSize, file, options)
+	}
 	params := state.uploadParams()
 	selection, err := resolveUploadPathsForParams(ctx, options, state.Endpoint, params)
 	if err != nil {
 		return result, err
-	}
-	if state.Sequential && len(selection.Paths) > 1 {
-		selection.Paths = selection.Paths[:1]
 	}
 	result.NetworkPaths = append([]transfer.NetworkPath(nil), selection.Paths...)
 	result.Multipart = true
@@ -231,18 +393,19 @@ func resumeExistingMultipart(ctx context.Context, client *driver.Pan115Client, d
 			if saveErr := saveUploadResume(options.ResumePath, *state); saveErr != nil {
 				return result, saveErr
 			}
+			options.reportBytes(fileSize, fileSize)
 			result.BytesUploaded = fileSize
 			result.Duration = time.Since(started)
 			return result, nil
 		}
-		resetUploadResumeToPrepared(state)
+		prepareMissingMultipartRetry(&options, state)
 		if saveErr := saveUploadResume(options.ResumePath, *state); saveErr != nil {
 			return result, errors.Join(err, saveErr)
 		}
 		if _, seekErr := file.Seek(0, io.SeekStart); seekErr != nil {
 			return result, seekErr
 		}
-		return UploadFile(ctx, client, dirID, fileName, fileSize, file, options)
+		return uploadFileResumable(ctx, client, dirID, fileName, fileSize, file, options)
 	}
 	if err != nil {
 		return result, err
@@ -270,9 +433,23 @@ func runResumableMultipart(ctx context.Context, client *driver.Pan115Client, dir
 	}
 	result.PartCount = len(allJobs)
 
+	completedBytes := fileSize
+	for _, job := range jobs {
+		completedBytes -= job.Size
+	}
+	if completedBytes < 0 {
+		completedBytes = 0
+	}
+	var progressBytes atomic.Int64
+	progressBytes.Store(completedBytes)
+	options.reportBytes(completedBytes, fileSize)
 	report, scheduleErr := transfer.ScheduleUploadParts(ctx, paths, jobs, func(ctx context.Context, path transfer.NetworkPath, job transfer.UploadPartJob) (transfer.UploadPartResult, error) {
-		return uploadPartWithRefresh(ctx, pool, imur, file, path, job)
-	}, transfer.WithUploadPartRetries(options.Retries), transfer.WithUploadPartHealthTracker(options.HealthTracker), transfer.WithUploadPartPreserveOrder(state.Sequential))
+		partResult, partErr := uploadPartWithRefresh(ctx, pool, imur, file, path, job)
+		if partErr == nil {
+			options.reportBytes(progressBytes.Add(job.Size), fileSize)
+		}
+		return partResult, partErr
+	}, transfer.WithUploadPartRetries(options.Retries), transfer.WithUploadPartWorkersPerInterface(options.WorkersPerInterface), transfer.WithUploadPartHealthTracker(options.HealthTracker), transfer.WithUploadPartPreserveOrder(state.Sequential))
 	if scheduleErr != nil {
 		// ResumePath is set, so deliberately keep the UploadID alive. A later
 		// invocation reconciles server-side parts with ListUploadedParts.
@@ -290,11 +467,22 @@ func runResumableMultipart(ctx context.Context, client *driver.Pan115Client, dir
 	}
 	body, err := completeMultipart(ctx, pool, paths, imur, parts, ptrUploadParams(state.uploadParams()), state.Sequential)
 	if err != nil {
+		if isUploadVerificationFailure(err) {
+			if resetErr := resetUploadResumeAfterVerificationFailure(options.ResumePath, state); resetErr != nil {
+				return result, errors.Join(err, resetErr)
+			}
+		}
 		return result, err
 	}
 	if err := parseUploadCallback(body, state.SHA1); err != nil {
+		if isUploadVerificationFailure(err) {
+			if resetErr := resetUploadResumeAfterVerificationFailure(options.ResumePath, state); resetErr != nil {
+				return result, errors.Join(err, resetErr)
+			}
+		}
 		return result, err
 	}
+	options.reportBytes(fileSize, fileSize)
 	state.Phase = uploadResumePhaseCompleted
 	if err := saveUploadResume(options.ResumePath, *state); err != nil {
 		return result, err
@@ -313,11 +501,19 @@ func resolveUploadPathsForParams(ctx context.Context, options Options, endpoint 
 	if err != nil {
 		return pathSelection{}, err
 	}
+	if options.Compatibility != nil {
+		options.Compatibility.ObserveNetworkPaths(selection.Paths)
+	}
+	selection = applyUploadCompatibilitySelection(options, selection)
 	if options.Progress != nil {
 		if selection.Warning != nil {
 			options.Progress(fmt.Sprintf("Network warning: %v", selection.Warning))
 		}
-		options.Progress(fmt.Sprintf("Using %d interface(s) for OSS upload...", len(selection.Paths)))
+		if options.forceSequential {
+			options.Progress(fmt.Sprintf("Using %d interface(s) for sequential compatibility failover (one ordered part at a time)...", len(selection.Paths)))
+		} else {
+			options.Progress(fmt.Sprintf("Using %d interface(s), up to %d connection(s) each for OSS upload...", len(selection.Paths), options.WorkersPerInterface))
+		}
 	}
 	return selection, nil
 }
@@ -396,6 +592,54 @@ func uploadTargetAlreadyPresent(client *driver.Pan115Client, dirID, fileName str
 		}
 	}
 	return false, nil
+}
+
+func migrateParallelSHA1ResumeToSequential(options *Options, state *uploadResumeState) bool {
+	if state == nil || state.Sequential {
+		return false
+	}
+	params := state.uploadParams()
+	if !uploadCallbackRequiresSequentialSHA1(&params) {
+		return false
+	}
+	requireSequentialUploadCompatibility(options, &params)
+	state.ForceSequential = true
+	resetUploadResumeToPrepared(state)
+	return true
+}
+
+func prepareMissingMultipartRetry(options *Options, state *uploadResumeState) {
+	if state == nil {
+		return
+	}
+	// A non-sequential UploadID that disappeared without producing a valid 115
+	// target is indistinguishable from the verification-failure state produced by
+	// older builds. Prefer the protocol-compatible sequential path on retry.
+	if !state.Sequential {
+		state.ForceSequential = true
+		if options != nil {
+			options.forceSequential = true
+			if options.Compatibility != nil {
+				options.Compatibility.RequireSequential()
+			}
+		}
+	}
+	resetUploadResumeToPrepared(state)
+}
+
+func resetUploadResumeAfterVerificationFailure(path string, state *uploadResumeState) error {
+	if state == nil {
+		return errors.New("upload resume state is nil during verification recovery")
+	}
+	resetUploadResumeToPrepared(state)
+	state.ForceSequential = true
+	if strings.TrimSpace(path) == "" {
+		return nil
+	}
+	// Keep only the stable file identity plus the compatibility latch. All stale
+	// OSS multipart fields were cleared above, so the next attempt negotiates a
+	// fresh object/upload ID and uses sequential OSS hashing.
+	return saveUploadResume(path, *state)
 }
 
 func resetUploadResumeToPrepared(state *uploadResumeState) {
