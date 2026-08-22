@@ -139,10 +139,10 @@ func TestReleasePackagingContractRunsBeforeGoReleaser(t *testing.T) {
 		"make verify-release-artifacts",
 		"Preserve first snapshot archive checksums",
 		"grep '\\.tar\\.gz$' dist/checksums.txt",
-		".release-archive-checksums.first",
+		"$RUNNER_TEMP/115driver-release-archive-checksums.first",
 		"Rebuild GoReleaser snapshot for reproducibility",
-		".release-archive-checksums.second",
-		"cmp .release-archive-checksums.first .release-archive-checksums.second",
+		"$RUNNER_TEMP/115driver-release-archive-checksums.second",
+		"cmp \"$first\" \"$second\"",
 		"Verify reproducible GoReleaser snapshot archives",
 	} {
 		if !strings.Contains(testWorkflow, needle) {

@@ -106,8 +106,9 @@ jobs:
 
       - name: Preserve first snapshot archive checksums
         run: |
-          grep '\.tar\.gz$' dist/checksums.txt | LC_ALL=C sort > .release-archive-checksums.first
-          test "$(wc -l < .release-archive-checksums.first)" -eq 6
+          first="$RUNNER_TEMP/115driver-release-archive-checksums.first"
+          grep '\.tar\.gz$' dist/checksums.txt | LC_ALL=C sort > "$first"
+          test "$(wc -l < "$first")" -eq 6
 
       - name: Rebuild GoReleaser snapshot for reproducibility
         uses: goreleaser/goreleaser-action@e435ccd777264be153ace6237001ef4d979d3a7a # v6
@@ -118,9 +119,11 @@ jobs:
 
       - name: Verify reproducible GoReleaser snapshot archives
         run: |
-          grep '\.tar\.gz$' dist/checksums.txt | LC_ALL=C sort > .release-archive-checksums.second
-          test "$(wc -l < .release-archive-checksums.second)" -eq 6
-          cmp .release-archive-checksums.first .release-archive-checksums.second
+          first="$RUNNER_TEMP/115driver-release-archive-checksums.first"
+          second="$RUNNER_TEMP/115driver-release-archive-checksums.second"
+          grep '\.tar\.gz$' dist/checksums.txt | LC_ALL=C sort > "$second"
+          test "$(wc -l < "$second")" -eq 6
+          cmp "$first" "$second"
           make verify-release-artifacts
 
   vet:
