@@ -13,7 +13,6 @@ import (
 	"os"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	hash "github.com/SheltonZhu/115driver/pkg/crypto"
@@ -30,18 +29,45 @@ func (c *Pan115Client) GetDigestResult(r io.Reader) (*hash.DigestResult, error) 
 
 // GetUploadEndpoint get upload endPoint
 func (c *Pan115Client) GetUploadEndpoint(endpoint *UploadEndpointResp) error {
+	if endpoint == nil {
+		return fmt.Errorf("upload endpoint output is nil: %w", ErrWrongParams)
+	}
 	req := c.NewRequest().
 		ForceContentType("application/json;charset=UTF-8").
-		SetResult(&endpoint)
-	_, err := req.Get(ApiGetUploadEndpoint)
+		SetResult(endpoint)
+	resp, err := req.Get(ApiGetUploadEndpoint)
 	if err != nil {
+		return sanitizeHTTPError(err)
+	}
+	if err := validateRestyHTTPStatus(resp); err != nil {
 		return err
+	}
+	if strings.TrimSpace(endpoint.Endpoint) == "" {
+		return fmt.Errorf("upload endpoint response is empty: %w", ErrUnexpected)
 	}
 	return nil
 }
 
-// GetUploadInfo get some info for upload
+// GetUploadInfo gets the account metadata required for uploads. The refresh is
+// serialized because parallel upload workers share one Pan115Client and publish
+// UserID/Userkey/UploadMetaInfo on that client.
 func (c *Pan115Client) GetUploadInfo() error {
+	c.uploadInfoMu.Lock()
+	defer c.uploadInfoMu.Unlock()
+	return c.getUploadInfoLocked()
+}
+
+func validateUploadInfoResponse(result UploadInfoResp) error {
+	if result.UserID <= 0 {
+		return fmt.Errorf("upload metadata response is missing a valid user_id")
+	}
+	if strings.TrimSpace(result.Userkey) == "" {
+		return fmt.Errorf("upload metadata response is missing userkey")
+	}
+	return nil
+}
+
+func (c *Pan115Client) getUploadInfoLocked() error {
 	result := UploadInfoResp{}
 	req := c.NewRequest().
 		ForceContentType("application/json;charset=UTF-8").
@@ -50,18 +76,54 @@ func (c *Pan115Client) GetUploadInfo() error {
 	if err = CheckErr(err, &result, resp); err != nil {
 		return err
 	}
+	if err := validateUploadInfoResponse(result); err != nil {
+		return err
+	}
+	if c.UserID != 0 && c.UserID != result.UserID {
+		return fmt.Errorf("upload metadata account mismatch: authenticated user %d, upload metadata user %d", c.UserID, result.UserID)
+	}
+	if c.UserID == 0 {
+		c.UserID = result.UserID
+	}
 	c.Userkey = result.Userkey
-	c.UserID = result.UserID
 	c.UploadMetaInfo = &result.UploadMetaInfo
 	return nil
 }
 
-// UploadAvailable check and prepare to upload
+func (c *Pan115Client) uploadInfoReadyLocked() bool {
+	return c.UserID != 0 && len(c.Userkey) > 0 && c.UploadMetaInfo != nil
+}
+
+func (c *Pan115Client) uploadPermissionErrorLocked() error {
+	if c.UploadMetaInfo == nil || c.UploadMetaInfo.UploadAllowed {
+		return nil
+	}
+	message := strings.TrimSpace(c.UploadMetaInfo.UploadAllowedMsg)
+	if message == "" {
+		return ErrUploadNotAllowed
+	}
+	return fmt.Errorf("%w: %s", ErrUploadNotAllowed, message)
+}
+
+// UploadAvailable checks and prepares upload metadata. The check-and-fetch
+// sequence is one critical section so concurrent batch workers perform at most
+// one successful initialization request and all observe fully published fields.
 func (c *Pan115Client) UploadAvailable() (bool, error) {
-	if c.UserID != 0 && len(c.Userkey) > 0 {
+	c.uploadInfoMu.Lock()
+	defer c.uploadInfoMu.Unlock()
+	if c.uploadInfoReadyLocked() {
+		if err := c.uploadPermissionErrorLocked(); err != nil {
+			return false, err
+		}
 		return true, nil
 	}
-	if err := c.GetUploadInfo(); err != nil {
+	if err := c.getUploadInfoLocked(); err != nil {
+		return false, err
+	}
+	if !c.uploadInfoReadyLocked() {
+		return false, fmt.Errorf("upload metadata remains incomplete after refresh")
+	}
+	if err := c.uploadPermissionErrorLocked(); err != nil {
 		return false, err
 	}
 	return true, nil
@@ -73,8 +135,24 @@ func (c *Pan115Client) UploadFastOrByOSS(dirID, fileName string, fileSize int64,
 	return c.RapidUploadOrByOSS(dirID, fileName, fileSize, r)
 }
 
+func validateUploadSourceSize(fileSize, actualSize int64) error {
+	if fileSize < 0 {
+		return fmt.Errorf("upload file size is negative: %w", ErrWrongParams)
+	}
+	if fileSize != actualSize {
+		return fmt.Errorf("upload file size mismatch: declared=%d actual=%d: %w", fileSize, actualSize, ErrWrongParams)
+	}
+	return nil
+}
+
 // RapidUploadOrByOSS Upload By OSS when unable to rapid upload file
 func (c *Pan115Client) RapidUploadOrByOSS(dirID, fileName string, fileSize int64, r io.ReadSeeker) error {
+	if r == nil {
+		return fmt.Errorf("upload reader is nil: %w", ErrWrongParams)
+	}
+	if fileSize < 0 {
+		return fmt.Errorf("upload file size is negative: %w", ErrWrongParams)
+	}
 	var (
 		err      error
 		digest   *hash.DigestResult
@@ -89,6 +167,12 @@ func (c *Pan115Client) RapidUploadOrByOSS(dirID, fileName string, fileSize int64
 	}
 	if digest, err = c.GetDigestResult(r); err != nil {
 		return err
+	}
+	if err := validateUploadSourceSize(fileSize, digest.Size); err != nil {
+		return err
+	}
+	if digest.Size > c.UploadMetaInfo.SizeLimit {
+		return ErrUploadTooLarge
 	}
 	// 闪传
 	if fastInfo, err = c.RapidUpload(
@@ -113,7 +197,10 @@ func (c *Pan115Client) getOSSEndpoint(enableInternalUpload bool) string {
 	if enableInternalUpload {
 		uploadEndpoint := UploadEndpointResp{}
 		if err := c.GetUploadEndpoint(&uploadEndpoint); err != nil {
-			// TODO warn error log
+			// Do not log the raw error: transport/API errors may include request
+			// context. The error type is enough to explain why internal OSS was
+			// disabled without exposing URLs, headers, cookies, or credentials.
+			c.debugf("internal upload endpoint discovery failed; falling back to public endpoint error_type=%T", err)
 			return OSSEndpoint
 		}
 		i := strings.Index(uploadEndpoint.Endpoint, ".aliyuncs.com")
@@ -121,6 +208,7 @@ func (c *Pan115Client) getOSSEndpoint(enableInternalUpload bool) string {
 			endpoint := uploadEndpoint.Endpoint[:i] + "-internal" + uploadEndpoint.Endpoint[i:]
 			return endpoint
 		}
+		c.debugf("internal upload endpoint is not Aliyun-compatible; falling back to public endpoint")
 	}
 	return OSSEndpoint
 }
@@ -130,8 +218,24 @@ func (c *Pan115Client) GetOSSEndpoint(enableInternalUpload bool) string {
 	return c.getOSSEndpoint(enableInternalUpload)
 }
 
+func validateUploadOSSParams(params *UploadOSSParams) error {
+	if params == nil {
+		return fmt.Errorf("OSS upload params are nil: %w", ErrWrongParams)
+	}
+	if strings.TrimSpace(params.Bucket) == "" || strings.TrimSpace(params.Object) == "" || strings.TrimSpace(params.SHA1) == "" {
+		return fmt.Errorf("OSS upload params are incomplete: %w", ErrWrongParams)
+	}
+	return nil
+}
+
 // UploadByOSS use aliyun sdk to upload
 func (c *Pan115Client) UploadByOSS(params *UploadOSSParams, r io.Reader, dirID string) error {
+	if err := validateUploadOSSParams(params); err != nil {
+		return err
+	}
+	if r == nil {
+		return fmt.Errorf("OSS upload reader is nil: %w", ErrWrongParams)
+	}
 	ossToken, err := c.GetOSSToken()
 	if err != nil {
 		return err
@@ -188,7 +292,13 @@ func (c *Pan115Client) GetOSSToken() (*UploadOSSTokenResp, error) {
 		SetResult(&result)
 
 	resp, err := req.Get(ApiUploadOSSToken)
-	return &result, CheckErr(err, &result, resp)
+	if err = CheckErr(err, &result, resp); err != nil {
+		return nil, err
+	}
+	if strings.TrimSpace(result.AccessKeyID) == "" || strings.TrimSpace(result.AccessKeySecret) == "" || strings.TrimSpace(result.SecurityToken) == "" {
+		return nil, fmt.Errorf("OSS upload token is incomplete: %w", ErrUnexpected)
+	}
+	return &result, nil
 }
 
 // UploadSHA1 upload a sha1, alias of RapidUpload
@@ -199,6 +309,12 @@ func (c *Pan115Client) UploadSHA1(fileSize int64, fileName, dirID, preID, fileID
 
 // RapidUpload rapid upload
 func (c *Pan115Client) RapidUpload(fileSize int64, fileName, dirID, preID, fileID string, r io.ReadSeeker) (*UploadInitResp, error) {
+	if r == nil {
+		return nil, fmt.Errorf("rapid upload reader is nil: %w", ErrWrongParams)
+	}
+	if fileSize < 0 {
+		return nil, fmt.Errorf("rapid upload file size is negative: %w", ErrWrongParams)
+	}
 	var (
 		ecdhCipher   *cipher.EcdhCipher
 		encrypted    []byte
@@ -231,7 +347,9 @@ func (c *Pan115Client) RapidUpload(fileSize int64, fileName, dirID, preID, fileI
 	form.Set("topupload", "true")
 
 	signKey, signVal := "", ""
-	for retry := true; retry; {
+	challengeCount := 0
+	for {
+		result = UploadInitResp{}
 		t := NowMilli()
 
 		if encodedToken, err = ecdhCipher.EncodeToken(t.ToInt64()); err != nil {
@@ -259,11 +377,24 @@ func (c *Pan115Client) RapidUpload(fileSize int64, fileName, dirID, preID, fileI
 			SetDoNotParseResponse(true)
 		resp, err := req.Post(ApiUploadInit)
 		if err != nil {
+			return nil, sanitizeHTTPError(err)
+		}
+		if resp == nil {
+			return nil, fmt.Errorf("rapid upload returned no response: %w", ErrUnexpected)
+		}
+		if err := validateRestyHTTPStatus(resp); err != nil {
+			if data := resp.RawBody(); data != nil {
+				_ = data.Close()
+			}
 			return nil, err
 		}
 		data := resp.RawBody()
-		defer data.Close()
-		if bodyBytes, err = io.ReadAll(data); err != nil {
+		if data == nil {
+			return nil, fmt.Errorf("rapid upload returned no response body: %w", ErrUnexpected)
+		}
+		bodyBytes, err = io.ReadAll(data)
+		_ = data.Close()
+		if err != nil {
 			return nil, err
 		}
 		if decrypted, err = ecdhCipher.Decrypt(bodyBytes); err != nil {
@@ -272,39 +403,74 @@ func (c *Pan115Client) RapidUpload(fileSize int64, fileName, dirID, preID, fileI
 		if err = CheckErr(json.Unmarshal(decrypted, &result), &result, resp); err != nil {
 			return nil, err
 		}
-		if result.Status == 7 {
-			// Update signKey & signVal
-			signKey = result.SignKey
-			signVal, _ = c.UploadDigestRange(r, result.SignCheck)
-		} else {
-			retry = false
-		}
 		result.SHA1 = fileID
+		var retry bool
+		signKey, signVal, retry, err = c.resolveRapidUploadSignChallenge(&result, challengeCount, r)
+		if err != nil {
+			return nil, err
+		}
+		if !retry {
+			break
+		}
+		challengeCount++
 	}
 
 	return &result, nil
 }
 
 const (
-	md5Salt = "Qclm8MGWUv59TnrR0XPg"
-	appVer  = "27.0.5.7"
+	md5Salt                      = "Qclm8MGWUv59TnrR0XPg"
+	appVer                       = "27.0.5.7"
+	maxRapidUploadSignChallenges = 3
 )
 
+func (c *Pan115Client) resolveRapidUploadSignChallenge(result *UploadInitResp, challengeCount int, r io.ReadSeeker) (signKey, signVal string, retry bool, err error) {
+	if result == nil {
+		return "", "", false, fmt.Errorf("rapid upload challenge response is nil: %w", ErrUnexpected)
+	}
+	if result.Status != 7 {
+		return "", "", false, nil
+	}
+	if challengeCount >= maxRapidUploadSignChallenges {
+		return "", "", false, fmt.Errorf("rapid upload exceeded %d sign challenges: %w", maxRapidUploadSignChallenges, ErrUnexpected)
+	}
+	signKey = strings.TrimSpace(result.SignKey)
+	signCheck := strings.TrimSpace(result.SignCheck)
+	if signKey == "" || signCheck == "" {
+		return "", "", false, fmt.Errorf("rapid upload sign challenge is incomplete: %w", ErrUnexpected)
+	}
+	signVal, err = c.UploadDigestRange(r, signCheck)
+	if err != nil {
+		return "", "", false, fmt.Errorf("rapid upload sign challenge failed: %w", err)
+	}
+	return signKey, signVal, true, nil
+}
+
 func (c *Pan115Client) UploadDigestRange(r io.ReadSeeker, rangeSpec string) (result string, err error) {
-	var start, end int64
-	if _, err = fmt.Sscanf(rangeSpec, "%d-%d", &start, &end); err != nil {
-		return
+	if r == nil {
+		return "", fmt.Errorf("upload digest reader is nil: %w", ErrWrongParams)
+	}
+	rangeSpec = strings.TrimSpace(rangeSpec)
+	startRaw, endRaw, ok := strings.Cut(rangeSpec, "-")
+	if !ok || startRaw == "" || endRaw == "" || strings.Contains(endRaw, "-") {
+		return "", fmt.Errorf("invalid upload digest range %q: %w", rangeSpec, ErrWrongParams)
+	}
+	start, err := strconv.ParseInt(startRaw, 10, 64)
+	if err != nil || start < 0 {
+		return "", fmt.Errorf("invalid upload digest range %q: %w", rangeSpec, ErrWrongParams)
+	}
+	end, err := strconv.ParseInt(endRaw, 10, 64)
+	if err != nil || end < start {
+		return "", fmt.Errorf("invalid upload digest range %q: %w", rangeSpec, ErrWrongParams)
 	}
 	h := sha1.New()
-	_, err = r.Seek(start, io.SeekStart)
-	if err != nil {
-		return
+	if _, err = r.Seek(start, io.SeekStart); err != nil {
+		return "", err
 	}
-	if _, err = io.CopyN(h, r, end-start+1); err == nil {
-		result = strings.ToUpper(hex.EncodeToString(h.Sum(nil)))
+	if _, err = io.CopyN(h, r, end-start+1); err != nil {
+		return "", err
 	}
-
-	return
+	return strings.ToUpper(hex.EncodeToString(h.Sum(nil))), nil
 }
 
 func (c *Pan115Client) GenerateSignature(fileID, target string) string {
@@ -329,6 +495,12 @@ func (c *Pan115Client) UploadFastOrByMultipart(dirID, fileName string, fileSize 
 
 // RapidUploadOrByMultipart upload by mutipart blocks when unable to rapid upload
 func (c *Pan115Client) RapidUploadOrByMultipart(dirID, fileName string, fileSize int64, r *os.File, opts ...UploadMultipartOption) error {
+	if r == nil {
+		return fmt.Errorf("upload file is nil: %w", ErrWrongParams)
+	}
+	if fileSize < 0 {
+		return fmt.Errorf("upload file size is negative: %w", ErrWrongParams)
+	}
 	var (
 		err      error
 		digest   *hash.DigestResult
@@ -343,6 +515,12 @@ func (c *Pan115Client) RapidUploadOrByMultipart(dirID, fileName string, fileSize
 	}
 	if digest, err = c.GetDigestResult(r); err != nil {
 		return err
+	}
+	if err := validateUploadSourceSize(fileSize, digest.Size); err != nil {
+		return err
+	}
+	if digest.Size > c.UploadMetaInfo.SizeLimit {
+		return ErrUploadTooLarge
 	}
 	// 闪传
 	if fastInfo, err = c.RapidUpload(
@@ -367,143 +545,172 @@ func (c *Pan115Client) RapidUploadOrByMultipart(dirID, fileName string, fileSize
 	return c.UploadByMultipart(&fastInfo.UploadOSSParams, digest.Size, r, dirID, opts...)
 }
 
-// UploadByMultipart upload by mutipart blocks
+func validateUploadCompletionMetadata(result *UploadResult, expectedSHA1 string, expectedSize int64) (needsVisibilityCheck bool, err error) {
+	if result == nil {
+		return false, fmt.Errorf("upload completion result is nil: %w", ErrUnexpected)
+	}
+	expectedSHA1 = strings.TrimSpace(expectedSHA1)
+	if expectedSHA1 == "" || expectedSize < 0 {
+		return false, fmt.Errorf("upload completion expectation is invalid: %w", ErrWrongParams)
+	}
+	responseSHA1 := strings.TrimSpace(result.Data.Sha1)
+	fileID := strings.TrimSpace(result.Data.FileID)
+	if responseSHA1 != "" && !strings.EqualFold(responseSHA1, expectedSHA1) {
+		return false, fmt.Errorf("upload completion SHA1 mismatch: expected=%q response=%q: %w", expectedSHA1, responseSHA1, ErrUnexpected)
+	}
+	if result.Data.FileSize < 0 {
+		return false, fmt.Errorf("upload completion returned negative file size: %w", ErrUnexpected)
+	}
+	if result.Data.FileSize > 0 && int64(result.Data.FileSize) != expectedSize {
+		return false, fmt.Errorf("upload completion size mismatch: expected=%d response=%d: %w", expectedSize, result.Data.FileSize, ErrUnexpected)
+	}
+	if fileID == "" || responseSHA1 == "" || (expectedSize > 0 && result.Data.FileSize == 0) {
+		return true, nil
+	}
+	return false, nil
+}
+
+// UploadByMultipart uploads multipart blocks sequentially. OSS sequential mode
+// requires ordered parts, so a synchronous loop avoids worker/channel leaks and
+// shared token/error races while preserving the existing retry semantics.
 func (c *Pan115Client) UploadByMultipart(params *UploadOSSParams, fileSize int64, f *os.File, dirID string, opts ...UploadMultipartOption) error {
-	var (
-		chunks    []oss.FileChunk
-		parts     []oss.UploadPart
-		imur      oss.InitiateMultipartUploadResult
-		ossClient *oss.Client
-		bucket    *oss.Bucket
-		ossToken  *UploadOSSTokenResp
-		bodyBytes []byte
-		err       error
-	)
+	if err := validateUploadOSSParams(params); err != nil {
+		return err
+	}
+	if f == nil {
+		return fmt.Errorf("multipart upload file is nil: %w", ErrWrongParams)
+	}
+	if fileSize < 0 {
+		return fmt.Errorf("multipart upload file size is negative: %w", ErrWrongParams)
+	}
+	stat, err := f.Stat()
+	if err != nil {
+		return fmt.Errorf("stat multipart upload file: %w", err)
+	}
+	if stat.Size() != fileSize {
+		return fmt.Errorf("multipart upload file size mismatch: declared=%d actual=%d: %w", fileSize, stat.Size(), ErrWrongParams)
+	}
 
 	options := DefaultUploadMultipartOptions()
-	if len(opts) > 0 {
-		for _, f := range opts {
-			f(options)
+	for _, apply := range opts {
+		if apply != nil {
+			apply(options)
 		}
 	}
-
+	if options.Timeout <= 0 {
+		return fmt.Errorf("multipart upload timeout must be positive: %w", ErrWrongParams)
+	}
+	if options.TokenRefreshTime <= 0 {
+		return fmt.Errorf("multipart upload token refresh interval must be positive: %w", ErrWrongParams)
+	}
 	options.ThreadsNum = 1
-	if ossToken, err = c.GetOSSToken(); err != nil {
+
+	ossToken, err := c.GetOSSToken()
+	if err != nil {
+		return err
+	}
+	endpoint := c.getOSSEndpoint(c.UseInternalUpload)
+	openBucket := func(token *UploadOSSTokenResp) (*oss.Bucket, error) {
+		ossClient, err := oss.New(
+			endpoint,
+			token.AccessKeyID,
+			token.AccessKeySecret,
+			oss.EnableMD5(true),
+			oss.EnableCRC(true),
+		)
+		if err != nil {
+			return nil, err
+		}
+		return ossClient.Bucket(params.Bucket)
+	}
+	bucket, err := openBucket(ossToken)
+	if err != nil {
 		return err
 	}
 
-	if ossClient, err = oss.New(
-		c.getOSSEndpoint(c.UseInternalUpload),
-		ossToken.AccessKeyID,
-		ossToken.AccessKeySecret,
-		oss.EnableMD5(true),
-		oss.EnableCRC(true),
-	); err != nil {
+	chunks, err := SplitFile(f.Name(), fileSize)
+	if err != nil {
 		return err
 	}
-
-	if bucket, err = ossClient.Bucket(params.Bucket); err != nil {
-		return err
+	if len(chunks) == 0 {
+		return fmt.Errorf("multipart split returned no chunks: %w", ErrUnexpected)
 	}
 
-	// ossToken一小时后就会失效，所以每50分钟重新获取一次
-	ticker := time.NewTicker(options.TokenRefreshTime)
-	defer ticker.Stop()
-	// 设置超时
-	timeout := time.NewTimer(options.Timeout)
-
-	if chunks, err = SplitFile(f.Name(), fileSize); err != nil {
-		return err
-	}
-
-	if imur, err = bucket.InitiateMultipartUpload(params.Object,
+	imur, err := bucket.InitiateMultipartUpload(params.Object,
 		oss.SetHeader(OssSecurityTokenHeaderName, ossToken.SecurityToken),
 		oss.UserAgentHeader(OSSUserAgent),
 		oss.EnableSha1(),
-		oss.Sequential(), // oss 启用Sequential必须按顺序上传, options.ThreadsNum = 1
-	); err != nil {
+		oss.Sequential(),
+	)
+	if err != nil {
 		return err
 	}
 
-	wg := sync.WaitGroup{}
-	wg.Add(len(chunks))
+	ticker := time.NewTicker(options.TokenRefreshTime)
+	defer ticker.Stop()
+	timeout := time.NewTimer(options.Timeout)
+	defer timeout.Stop()
 
-	chunksCh := make(chan oss.FileChunk)
-	errCh := make(chan error)
-	UploadedPartsCh := make(chan oss.UploadPart)
-	quit := make(chan struct{})
-
-	// producter
-	go chunksProducer(chunksCh, chunks)
-	go func() {
-		wg.Wait()
-		quit <- struct{}{}
-	}()
-
-	// consumers
-	for i := 0; i < options.ThreadsNum; i++ {
-		go func(threadId int) {
-			defer func() {
-				if r := recover(); r != nil {
-					errCh <- fmt.Errorf("recovered in %v", r)
-				}
-			}()
-			for chunk := range chunksCh {
-				var part oss.UploadPart // 出现错误就继续尝试，共尝试3次
-				for retry := 0; retry < 3; retry++ {
-					select {
-					case <-ticker.C:
-						if ossToken, err = c.GetOSSToken(); err != nil { // 到时重新获取ossToken
-							errCh <- errors.Wrap(err, "刷新token时出现错误")
-						}
-					default:
-					}
-
-					buf := make([]byte, chunk.Size)
-					if _, err = f.ReadAt(buf, chunk.Offset); err != nil && !errors.Is(err, io.EOF) {
-						continue
-					}
-
-					if part, err = bucket.UploadPart(
-						imur,
-						bytes.NewBuffer(buf),
-						chunk.Size,
-						chunk.Number,
-						OssOption(params, ossToken)...); err == nil {
-						break
-					}
-				}
-				if err != nil {
-					errCh <- errors.Wrap(err, fmt.Sprintf("上传 %s 的第%d个分片时出现错误：%v", f.Name(), chunk.Number, err))
-				}
-				UploadedPartsCh <- part
-			}
-		}(i)
-	}
-
-	go func() {
-		for part := range UploadedPartsCh {
-			parts = append(parts, part)
-			wg.Done()
-		}
-	}()
-LOOP:
-	for {
+	parts := make([]oss.UploadPart, 0, len(chunks))
+	for _, chunk := range chunks {
 		select {
-		case <-ticker.C:
-			// 到时重新获取ossToken
-			if ossToken, err = c.GetOSSToken(); err != nil {
-				return err
-			}
-		case <-quit:
-			break LOOP
-		case <-errCh:
-			return err
 		case <-timeout.C:
-			return fmt.Errorf("time out")
+			return fmt.Errorf("multipart upload timed out after %s: %w", options.Timeout, ErrUnexpected)
+		default:
 		}
+
+		buf := make([]byte, chunk.Size)
+		if _, err := f.ReadAt(buf, chunk.Offset); err != nil {
+			return fmt.Errorf("read multipart upload part %d: %w", chunk.Number, err)
+		}
+
+		var part oss.UploadPart
+		var partErr error
+		for retry := 0; retry < 3; retry++ {
+			select {
+			case <-timeout.C:
+				return fmt.Errorf("multipart upload timed out after %s: %w", options.Timeout, ErrUnexpected)
+			default:
+			}
+			select {
+			case <-ticker.C:
+				refreshed, refreshErr := c.GetOSSToken()
+				if refreshErr != nil {
+					return errors.Wrap(refreshErr, "refresh OSS upload token")
+				}
+				refreshedBucket, bucketErr := openBucket(refreshed)
+				if bucketErr != nil {
+					return errors.Wrap(bucketErr, "recreate OSS bucket after token refresh")
+				}
+				ossToken = refreshed
+				bucket = refreshedBucket
+			default:
+			}
+
+			part, partErr = bucket.UploadPart(
+				imur,
+				bytes.NewReader(buf),
+				chunk.Size,
+				chunk.Number,
+				OssOption(params, ossToken)...,
+			)
+			if partErr == nil {
+				break
+			}
+		}
+		if partErr != nil {
+			return errors.Wrapf(partErr, "upload %s part %d after 3 attempts", f.Name(), chunk.Number)
+		}
+		parts = append(parts, part)
 	}
 
+	select {
+	case <-timeout.C:
+		return fmt.Errorf("multipart upload timed out after %s: %w", options.Timeout, ErrUnexpected)
+	default:
+	}
+
+	var bodyBytes []byte
 	if _, err := bucket.CompleteMultipartUpload(imur, parts,
 		append(
 			OssOption(params, ossToken),
@@ -516,41 +723,57 @@ LOOP:
 	if err = json.Unmarshal(bodyBytes, &uploadResult); err != nil {
 		return err
 	}
-	return uploadResult.Err(string(bodyBytes))
-}
-
-func chunksProducer(ch chan oss.FileChunk, chunks []oss.FileChunk) {
-	for _, chunk := range chunks {
-		ch <- chunk
+	if err = uploadResult.Err(string(bodyBytes)); err != nil {
+		return err
 	}
+	needsVisibilityCheck, err := validateUploadCompletionMetadata(&uploadResult, params.SHA1, fileSize)
+	if err != nil {
+		return err
+	}
+	if needsVisibilityCheck {
+		return c.checkUploadStatus(dirID, params.SHA1)
+	}
+	return nil
 }
 
-// SplitFile pplitFile
-func SplitFile(filePath string, fileSize int64) (chunks []oss.FileChunk, err error) {
+func splitFilePartNum(fileSize int64) int {
 	for i := int64(1); i < 10; i++ {
-		if fileSize < i*GB { // 文件大小小于iGB时分为i*1000片
-			if chunks, err = oss.SplitFileByPartNum(filePath, int(i*1000)); err != nil {
-				return
-			}
-			break
+		if fileSize < i*GB {
+			return int(i * 1000)
 		}
 	}
-	if fileSize > 9*GB { // 文件大小大于9GB时分为10000片
-		if chunks, err = oss.SplitFileByPartNum(filePath, 10000); err != nil {
-			return
-		}
+	return 10000
+}
+
+// SplitFile splits a file into OSS multipart chunks.
+func SplitFile(filePath string, fileSize int64) (chunks []oss.FileChunk, err error) {
+	if fileSize < 0 {
+		return nil, fmt.Errorf("split file size is negative: %w", ErrWrongParams)
 	}
-	// 单个分片大小不能小于100KB
+	chunks, err = oss.SplitFileByPartNum(filePath, splitFilePartNum(fileSize))
+	if err != nil {
+		return nil, err
+	}
+	if len(chunks) == 0 {
+		return nil, fmt.Errorf("split file returned no chunks: %w", ErrUnexpected)
+	}
 	if chunks[0].Size < 100*KB {
-		if chunks, err = oss.SplitFileByPartSize(filePath, 100*KB); err != nil {
-			return
+		chunks, err = oss.SplitFileByPartSize(filePath, 100*KB)
+		if err != nil {
+			return nil, err
+		}
+		if len(chunks) == 0 {
+			return nil, fmt.Errorf("split file by part size returned no chunks: %w", ErrUnexpected)
 		}
 	}
-	return
+	return chunks, nil
 }
 
 // OssOption get options
 func OssOption(params *UploadOSSParams, ossToken *UploadOSSTokenResp) []oss.Option {
+	if params == nil || ossToken == nil {
+		return nil
+	}
 	options := []oss.Option{
 		oss.SetHeader(OssSecurityTokenHeaderName, ossToken.SecurityToken),
 		oss.Callback(base64.StdEncoding.EncodeToString([]byte(params.Callback.Callback))),

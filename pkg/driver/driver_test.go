@@ -1,12 +1,15 @@
 package driver
 
 import (
+	"errors"
 	"io"
+	"net/http"
 	"os"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/go-resty/resty/v2"
 	"github.com/stretchr/testify/assert"
 )
 
@@ -20,6 +23,25 @@ func TestMain(m *testing.M) {
 	os.Exit(m.Run())
 }
 
+type driverTestRoundTripFunc func(*http.Request) (*http.Response, error)
+
+func (fn driverTestRoundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
+	return fn(req)
+}
+
+func newOfflineStatusClient() *Pan115Client {
+	transport := driverTestRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Status:     "200 OK",
+			Header:     http.Header{"Content-Type": {"application/json"}},
+			Body:       io.NopCloser(strings.NewReader(`{"state":false,"error":"offline test"}`)),
+			Request:    req,
+		}, nil
+	})
+	return New(WithRestyClient(resty.NewWithClient(&http.Client{Transport: transport}))).ImportCredential(&Credential{})
+}
+
 func TestImportFromCookie(t *testing.T) {
 	cr := &Credential{}
 	assert.Nil(t, cr.FromCookie("UID=1;CID=2;SEID=3;KID=12;other=4"))
@@ -30,19 +52,83 @@ func TestImportFromCookie(t *testing.T) {
 }
 
 func TestLoginErr(t *testing.T) {
-	assert.Error(t, New().ImportCredential(&Credential{}).LoginCheck())
+	assert.Error(t, newOfflineStatusClient().LoginCheck())
 }
 
 func TestBadCookie(t *testing.T) {
-	assert.Error(t, New().ImportCredential(&Credential{}).CookieCheck())
+	assert.ErrorIs(t, newOfflineStatusClient().CookieCheck(), ErrBadCookie)
+}
+
+func require115Integration(t *testing.T) {
+	t.Helper()
+	if os.Getenv("RUN_115_INTEGRATION") != "1" {
+		t.Skip("requires RUN_115_INTEGRATION=1 for live 115 integration")
+	}
+	if strings.TrimSpace(cookieStr) == "" {
+		t.Skip("requires COOKIE for live 115 integration")
+	}
+}
+
+func require115DestructiveIntegration(t *testing.T) {
+	t.Helper()
+	require115Integration(t)
+	if os.Getenv("RUN_115_DESTRUCTIVE_INTEGRATION") != "1" {
+		t.Skip("requires RUN_115_DESTRUCTIVE_INTEGRATION=1 for destructive live 115 integration")
+	}
 }
 
 func teardown(t *testing.T) func(t *testing.T) {
+	require115Integration(t)
 	cr := &Credential{}
 	assert.Nil(t, cr.FromCookie(cookieStr))
 	client = New(UA(UA115Browser), WithDebug(), WithTrace()).ImportCredential(cr)
 	assert.Nil(t, client.CookieCheck())
 	return func(t *testing.T) {}
+}
+
+func destructiveTeardown(t *testing.T) func(t *testing.T) {
+	require115DestructiveIntegration(t)
+	return teardown(t)
+}
+
+func TestReadOnlyIntegrationSmoke(t *testing.T) {
+	require115Integration(t)
+
+	cr := &Credential{}
+	if err := cr.FromCookie(cookieStr); err != nil {
+		t.Fatalf("parse integration COOKIE: %v", err)
+	}
+	liveClient := New(UA(UA115Browser)).ImportCredential(cr)
+	if err := liveClient.CookieCheck(); err != nil {
+		t.Fatalf("cookie check: %v", err)
+	}
+
+	user, err := liveClient.GetUser()
+	if err != nil {
+		t.Fatalf("get user: %v", err)
+	}
+	if user == nil {
+		t.Fatal("get user returned nil result")
+	}
+
+	if _, err := liveClient.GetInfo(); err != nil {
+		t.Fatalf("get info: %v", err)
+	}
+
+	files, err := liveClient.ListPage("0", 0, 1, WithRecordOpenTime(false))
+	if err != nil {
+		t.Fatalf("list root page: %v", err)
+	}
+	if files == nil {
+		t.Fatal("list root page returned nil result")
+	}
+
+	if _, err := liveClient.ListRecycleBin(0, 1); err != nil {
+		t.Fatalf("list recycle bin: %v", err)
+	}
+	if _, err := liveClient.ListOfflineTask(1); err != nil {
+		t.Fatalf("list offline tasks: %v", err)
+	}
 }
 
 func TestListRecycleBin(t *testing.T) {
@@ -53,7 +139,7 @@ func TestListRecycleBin(t *testing.T) {
 }
 
 func TestCleanRecycleBin(t *testing.T) {
-	down := teardown(t)
+	down := destructiveTeardown(t)
 	defer down(t)
 	err := client.CleanRecycleBin("xx", "1", "2")
 	assert.NotNil(t, err)
@@ -67,24 +153,27 @@ func TestListOfflineTasks(t *testing.T) {
 }
 
 func TestRevertRecycleBin(t *testing.T) {
-	down := teardown(t)
+	down := destructiveTeardown(t)
 	defer down(t)
 	err := client.RevertRecycleBin("xx", "1", "2")
 	assert.NotNil(t, err)
 }
 
 func TestOfflineAddUri(t *testing.T) {
-	down := teardown(t)
+	down := destructiveTeardown(t)
 	defer down(t)
 
 	uri := "https://x.com/Olympics/status/1820550228640203065/photo/1"
 	hashs, err := client.AddOfflineTaskURIs([]string{uri}, "0")
-	assert.Nil(t, err)
+	if errors.Is(err, ErrOfflineTaskExisted) {
+		return
+	}
+	assert.NoError(t, err)
 	assert.NotEmpty(t, hashs)
 }
 
 func TestOfflineDelUri(t *testing.T) {
-	down := teardown(t)
+	down := destructiveTeardown(t)
 	defer down(t)
 
 	err := client.DeleteOfflineTasks([]string{"1123", "1231"}, true)
@@ -92,7 +181,7 @@ func TestOfflineDelUri(t *testing.T) {
 }
 
 func TestOfflineClearUri(t *testing.T) {
-	down := teardown(t)
+	down := destructiveTeardown(t)
 	defer down(t)
 
 	err := client.ClearOfflineTasks(1)
@@ -100,7 +189,7 @@ func TestOfflineClearUri(t *testing.T) {
 }
 
 func TestMkdir(t *testing.T) {
-	down := teardown(t)
+	down := destructiveTeardown(t)
 	defer down(t)
 
 	dirName := NowMilli().String()
@@ -111,7 +200,7 @@ func TestMkdir(t *testing.T) {
 }
 
 func TestDelete(t *testing.T) {
-	down := teardown(t)
+	down := destructiveTeardown(t)
 	defer down(t)
 
 	dirName := NowMilli().String()
@@ -119,7 +208,7 @@ func TestDelete(t *testing.T) {
 }
 
 func TestRename(t *testing.T) {
-	down := teardown(t)
+	down := destructiveTeardown(t)
 	defer down(t)
 
 	dirName := NowMilli().String()
@@ -127,7 +216,7 @@ func TestRename(t *testing.T) {
 }
 
 func TestCopy(t *testing.T) {
-	down := teardown(t)
+	down := destructiveTeardown(t)
 	defer down(t)
 
 	dirName := NowMilli().String()
@@ -135,7 +224,7 @@ func TestCopy(t *testing.T) {
 }
 
 func TestMove(t *testing.T) {
-	down := teardown(t)
+	down := destructiveTeardown(t)
 	defer down(t)
 
 	dirName := NowMilli().String()
@@ -146,10 +235,10 @@ func TestList(t *testing.T) {
 	down := teardown(t)
 	defer down(t)
 
-	f1, err := client.List("0", WithApiURLs(ApiFileList))
+	f1, err := client.List("0", WithApiURLs(ApiFileList), WithRecordOpenTime(false))
 	assert.NotEmpty(t, *f1)
 	assert.Nil(t, err)
-	f2, err := client.List("0", WithApiURLs(ApiFileList1))
+	f2, err := client.List("0", WithApiURLs(ApiFileList1), WithRecordOpenTime(false))
 	assert.NotEmpty(t, *f2)
 	assert.Nil(t, err)
 	// f3, err := client.List("0", WithApiURLs(ApiFileList2))
@@ -163,7 +252,7 @@ func TestList(t *testing.T) {
 	// assert.Equal(t, *f1, *f3)
 	// assert.Equal(t, *f1, *f4)
 	dirName := NowMilli().String()
-	f, err := client.List(dirName)
+	f, err := client.List(dirName, WithRecordOpenTime(false))
 	assert.Nil(t, err)
 	assert.Empty(t, *f)
 }
@@ -181,7 +270,7 @@ func TestListPage(t *testing.T) {
 	down := teardown(t)
 	defer down(t)
 
-	f, err := client.ListPage("0", 0, 5)
+	f, err := client.ListPage("0", 0, 5, WithRecordOpenTime(false))
 	assert.NotEmpty(t, *f)
 	assert.Nil(t, err)
 }
@@ -221,13 +310,14 @@ func TestGetUploadInfo(t *testing.T) {
 }
 
 func TestGetUPloadEndpoint(t *testing.T) {
+	require115Integration(t)
 	result := UploadEndpointResp{}
 	assert.NoError(t, New().GetUploadEndpoint(&result))
 	assert.NotEmpty(t, result)
 }
 
 func TestUploadSHA1(t *testing.T) {
-	down := teardown(t)
+	down := destructiveTeardown(t)
 	defer down(t)
 
 	r := strings.NewReader(NowMilli().String())
@@ -247,7 +337,7 @@ func TestGetOSSToken(t *testing.T) {
 }
 
 func TestUploadByOSS(t *testing.T) {
-	down := teardown(t)
+	down := destructiveTeardown(t)
 	defer down(t)
 
 	randStr := NowMilli().String()
@@ -265,7 +355,7 @@ func TestUploadByOSS(t *testing.T) {
 }
 
 func TestUpload(t *testing.T) {
-	down := teardown(t)
+	down := destructiveTeardown(t)
 	defer down(t)
 
 	randStr := NowMilli().String()
@@ -276,7 +366,7 @@ func TestUpload(t *testing.T) {
 func TestUploadMultipart(t *testing.T) {
 	start := time.Now()
 
-	down := teardown(t)
+	down := destructiveTeardown(t)
 	defer down(t)
 
 	f, err := os.CreateTemp("./", "test-temp-*")

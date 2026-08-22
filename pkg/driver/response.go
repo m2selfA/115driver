@@ -3,6 +3,8 @@ package driver
 import (
 	"encoding/json"
 	"fmt"
+	"io"
+	"strings"
 	"time"
 )
 
@@ -225,6 +227,9 @@ type DownloadResp struct {
 type DataString string
 
 func (v *DataString) UnmarshalJSON(b []byte) (err error) {
+	if len(b) == 0 {
+		return io.ErrUnexpectedEOF
+	}
 	var s string
 	if b[0] == '"' {
 		err = json.Unmarshal(b, &s)
@@ -284,6 +289,44 @@ type FileParentInfo struct {
 }
 
 func (r *FileStatResponse) Err(respBody ...string) error {
+	if r == nil {
+		return ErrUnexpected
+	}
+	if len(respBody) == 0 {
+		// Preserve the v0.1.4 direct-call behavior. CheckErr always supplies the
+		// raw response body, which is where the newer fail-closed validation runs.
+		return nil
+	}
+	var envelope struct {
+		Errno        StringInt       `json:"errno,omitempty"`
+		ErrNo        int             `json:"errNo,omitempty"`
+		Code         int             `json:"code,omitempty"`
+		Error        string          `json:"error,omitempty"`
+		Message      string          `json:"message,omitempty"`
+		Msg          string          `json:"msg,omitempty"`
+		State        *bool           `json:"state,omitempty"`
+		FileCategory json.RawMessage `json:"file_category"`
+	}
+	if err := json.Unmarshal([]byte(respBody[0]), &envelope); err != nil {
+		return fmt.Errorf("decode stat response envelope: %w", ErrUnexpected)
+	}
+	code := int(envelope.Errno)
+	if envelope.ErrNo != 0 {
+		code = envelope.ErrNo
+	}
+	if envelope.Code != 0 {
+		code = envelope.Code
+	}
+	hasMessage := strings.TrimSpace(envelope.Error) != "" || strings.TrimSpace(envelope.Message) != "" || strings.TrimSpace(envelope.Msg) != ""
+	if (envelope.State != nil && !*envelope.State) || code != 0 || hasMessage {
+		return GetErr(code, respBody[0])
+	}
+	category := strings.TrimSpace(string(envelope.FileCategory))
+	if category == "" || category == "null" {
+		return fmt.Errorf("stat response is missing file category: %w", ErrUnexpected)
+	}
+	// Successful category/get responses historically omit a state field and
+	// expose the file/directory properties directly at the top level.
 	return nil
 }
 

@@ -41,6 +41,9 @@ func (f *File) From(fileInfo *FileInfo) *File {
 }
 
 func (f *File) from(fileInfo *FileInfo) *File {
+	if fileInfo == nil {
+		return f
+	}
 	if fileInfo.FileID != "" {
 		f.FileID = fileInfo.FileID
 		f.ParentID = string(fileInfo.CategoryID)
@@ -70,13 +73,16 @@ func (f *File) from(fileInfo *FileInfo) *File {
 	f.Sha1 = fileInfo.Sha1
 
 	f.Star = fileInfo.IsStar != 0
-	f.Labels = make([]*Label, len(fileInfo.Labels))
-	for i, l := range fileInfo.Labels {
-		f.Labels[i] = &Label{
+	f.Labels = make([]*Label, 0, len(fileInfo.Labels))
+	for _, l := range fileInfo.Labels {
+		if l == nil {
+			continue
+		}
+		f.Labels = append(f.Labels, &Label{
 			ID:    l.ID,
 			Name:  l.Name,
 			Color: LabelColor(LabelColorMap[l.Color]),
-		}
+		})
 	}
 
 	f.CreateTime = time.Unix(int64(fileInfo.CreateTime), 0)

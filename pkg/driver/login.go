@@ -18,7 +18,14 @@ func (c *Pan115Client) CookieCheck() error {
 		SetQueryParam("_", NowMilli().String()).
 		SetResult(&result)
 
-	if _, _ = req.Get(ApiStatusCheck); !result.State {
+	resp, err := req.Get(ApiStatusCheck)
+	if err != nil {
+		return sanitizeHTTPError(err)
+	}
+	if err := validateRestyHTTPStatus(resp); err != nil {
+		return err
+	}
+	if !result.State {
 		return ErrBadCookie
 	}
 	return nil
@@ -34,12 +41,18 @@ func (c *Pan115Client) LoginCheck() error {
 	if err = CheckErr(err, &result, resp); err != nil {
 		return err
 	}
+	if result.Data.UserID <= 0 {
+		return fmt.Errorf("login check returned invalid user id: %w", ErrUnexpected)
+	}
 	c.UserID = result.Data.UserID
 	return nil
 }
 
 // ImportCredential import uid, cid, seid
 func (c *Pan115Client) ImportCredential(cr *Credential) *Pan115Client {
+	if cr == nil {
+		return c
+	}
 	cookies := map[string]string{
 		CookieNameUid:  cr.UID,
 		CookieNameCid:  cr.CID,
@@ -52,12 +65,19 @@ func (c *Pan115Client) ImportCredential(cr *Credential) *Pan115Client {
 
 func (c *Pan115Client) ImportCookies(cookies map[string]string, domains ...string) {
 	for _, domain := range domains {
+		domain = strings.TrimSpace(domain)
+		if domain == "" {
+			continue
+		}
 		c.importCookies(cookies, domain, "/")
 	}
 }
 
 func (c *Pan115Client) importCookies(cookies map[string]string, domain string, path string) {
-	// Make a dummy URL for saving cookie
+	// Make a dummy URL for saving cookie.
+	if domain == "" {
+		return
+	}
 	url := &neturl.URL{
 		Scheme: "https",
 		Path:   "/",
@@ -99,12 +119,15 @@ func (cr *Credential) FromCookie(cookie string) error {
 
 	cookieMap := map[string]string{}
 	for _, item := range items {
-		pairs := strings.Split(strings.TrimSpace(item), "=")
+		pairs := strings.SplitN(strings.TrimSpace(item), "=", 2)
 		if len(pairs) != 2 {
 			return ErrBadCookie
 		}
-		key := pairs[0]
-		value := pairs[1]
+		key := strings.TrimSpace(pairs[0])
+		value := strings.TrimSpace(pairs[1])
+		if key == "" {
+			return ErrBadCookie
+		}
 		cookieMap[strings.ToUpper(key)] = value
 	}
 	cr.UID = cookieMap["UID"]
@@ -130,5 +153,11 @@ func (c *Pan115Client) GetUser() (*UserInfo, error) {
 		SetQueryParam("_", Now().String()).
 		SetResult(&result)
 	resp, err := req.Get(ApiUserInfo)
-	return &result.UserInfo, CheckErr(err, &result, resp)
+	if err = CheckErr(err, &result, resp); err != nil {
+		return nil, err
+	}
+	if result.UserInfo.UserID <= 0 {
+		return nil, fmt.Errorf("user info returned invalid user id: %w", ErrUnexpected)
+	}
+	return &result.UserInfo, nil
 }

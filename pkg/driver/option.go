@@ -24,12 +24,18 @@ func UA(userAgent ...string) Option {
 
 func WithClient(hc *http.Client) Option {
 	return func(c *Pan115Client) {
+		if hc == nil {
+			return
+		}
 		c.SetHttpClient(hc)
 	}
 }
 
 func WithRestyClient(resty *resty.Client) Option {
 	return func(c *Pan115Client) {
+		if resty == nil {
+			return
+		}
 		c.Client = resty
 		// The new client does not have the empty-UA handling hooks
 		// installed; re-install them (see applyEmptyUAHandling).
@@ -73,12 +79,13 @@ const (
 
 // GetFileOption get file options
 type GetFileOption struct {
-	order    string
-	asc      string
-	pageSize int64
-	offset   int64
-	showDir  string
-	apiURL   string
+	order          string
+	asc            string
+	pageSize       int64
+	offset         int64
+	showDir        string
+	apiURL         string
+	recordOpenTime string
 }
 
 type GetFileOptions func(o *GetFileOption)
@@ -101,6 +108,15 @@ func WithOffset(offset int64) GetFileOptions {
 	}
 }
 
+func withRecordOpenTime(record bool) GetFileOptions {
+	return func(o *GetFileOption) {
+		o.recordOpenTime = "0"
+		if record {
+			o.recordOpenTime = "1"
+		}
+	}
+}
+
 func WithOrder(order string) GetFileOptions {
 	return func(o *GetFileOption) {
 		o.order = order
@@ -118,9 +134,9 @@ func WithShowDirEnable(e bool) GetFileOptions {
 
 func WithAsc(d bool) GetFileOptions {
 	return func(o *GetFileOption) {
-		o.showDir = "0"
+		o.asc = "0"
 		if d {
-			o.showDir = "1"
+			o.asc = "1"
 		}
 	}
 }
@@ -149,14 +165,19 @@ func (o *GetFileOption) GetshowDir() string {
 	return o.showDir
 }
 
+func (o *GetFileOption) GetRecordOpenTime() string {
+	return o.recordOpenTime
+}
+
 func DefaultGetFileOptions() *GetFileOption {
 	return &GetFileOption{
-		order:    FileOrderByTime,
-		asc:      "1",
-		pageSize: int64(56),
-		offset:   int64(0),
-		showDir:  "1",
-		apiURL:   ApiFileList,
+		order:          FileOrderByTime,
+		asc:            "1",
+		pageSize:       int64(56),
+		offset:         int64(0),
+		showDir:        "1",
+		apiURL:         ApiFileList,
+		recordOpenTime: "1",
 	}
 }
 
@@ -201,7 +222,8 @@ func UploadMultipartWithTokenRefreshTime(refreshTime time.Duration) UploadMultip
 }
 
 type ListOptions struct {
-	ApiURLs []string
+	ApiURLs        []string
+	recordOpenTime bool
 }
 
 func DefaultListOptions() *ListOptions {
@@ -211,7 +233,8 @@ func DefaultListOptions() *ListOptions {
 		// Web-cookie-compatible HTTPS primary with the same list response shape.
 		// Keep defaults HTTPS-only so credentials never downgrade to the legacy
 		// http://web.api.115.com endpoint.
-		ApiURLs: []string{ApiFileListByName, ApiFileList},
+		ApiURLs:        []string{ApiFileListByName, ApiFileList},
+		recordOpenTime: true,
 	}
 }
 
@@ -222,6 +245,14 @@ func WithApiURLs(urls ...string) ListOption {
 		if len(urls) > 0 {
 			o.ApiURLs = urls
 		}
+	}
+}
+
+// WithRecordOpenTime controls whether file-list requests ask 115 to record
+// directory open-time metadata. The default is true for compatibility.
+func WithRecordOpenTime(record bool) ListOption {
+	return func(o *ListOptions) {
+		o.recordOpenTime = record
 	}
 }
 

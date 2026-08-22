@@ -32,6 +32,8 @@ type Pan115Client struct {
 	debug             bool
 	debugWriter       io.Writer
 	debugMu           sync.Mutex
+	requestMu         sync.Mutex
+	uploadInfoMu      sync.Mutex
 }
 
 // New creates Client with customized options.
@@ -43,10 +45,11 @@ func New(opts ...Option) *Pan115Client {
 
 	c.applyEmptyUAHandling()
 
-	if len(opts) > 0 {
-		for _, optFunc := range opts {
-			optFunc(c)
+	for _, optFunc := range opts {
+		if optFunc == nil {
+			continue
 		}
+		optFunc(c)
 	}
 	return c
 }
@@ -92,10 +95,12 @@ func (c *Pan115Client) applyEmptyUAHandling() {
 	// Driver debug mode uses the bounded metadata-only logger below instead.
 	c.Client.SetDebug(false)
 
-	// Hook 1: before resty's middleware — replace an explicitly empty UA
-	// (request level) or client level with the sentinel. Client headers are
-	// checked separately because they are merged into the request by
-	// parseRequestHeader after this hook runs.
+	// Hook 1: before resty's middleware — replace an explicitly empty UA with
+	// the sentinel on the request itself. If the configured client-level UA is
+	// explicitly empty, copy the sentinel to the request instead of mutating
+	// client.Header. Resty's parseRequestHeader preserves request-level values,
+	// so this both suppresses its default UA and keeps concurrent requests from
+	// racing through temporary client-level header mutations.
 	c.Client.OnBeforeRequest(func(client *resty.Client, r *resty.Request) error {
 		// Request-level Resty debug can override the client setting, so suppress it
 		// before Resty's request logger runs as well.
@@ -104,20 +109,17 @@ func (c *Pan115Client) applyEmptyUAHandling() {
 			r.Header.Set("User-Agent", sentinelEmptyUA)
 			return nil
 		}
-		if isEmptyUA(client.Header) {
-			client.SetHeader("User-Agent", sentinelEmptyUA)
+		if _, requestHasUA := r.Header[http.CanonicalHeaderKey("User-Agent")]; !requestHasUA && isEmptyUA(client.Header) {
+			r.Header.Set("User-Agent", sentinelEmptyUA)
 		}
 		return nil
 	})
 
 	// Hook 2: after resty's middleware — strip the sentinel from the
-	// RawRequest that is actually sent, so the wire bytes have no
-	// User-Agent header. Also restore the client-level header so it does
-	// not leak the sentinel into subsequent requests.
-	c.Client.SetPreRequestHook(func(client *resty.Client, req *http.Request) error {
-		if client.Header.Get("User-Agent") == sentinelEmptyUA {
-			client.SetHeader("User-Agent", "")
-		}
+	// RawRequest that is actually sent, so the wire bytes have no User-Agent
+	// header. All sentinel state is request-local; client headers stay immutable
+	// while requests are in flight.
+	c.Client.SetPreRequestHook(func(_ *resty.Client, req *http.Request) error {
 		if req.Header.Get("User-Agent") == sentinelEmptyUA {
 			req.Header.Set("User-Agent", "")
 		}
@@ -213,6 +215,9 @@ func Defalut() *Pan115Client {
 }
 
 func (c *Pan115Client) SetHttpClient(httpClient *http.Client) *Pan115Client {
+	if httpClient == nil {
+		return c
+	}
 	c.Client = resty.NewWithClient(httpClient)
 	c.uaHandlingDone = false
 	c.applyEmptyUAHandling()
@@ -248,13 +253,19 @@ func (c *Pan115Client) SetProxy(proxy string) *Pan115Client {
 }
 
 func (c *Pan115Client) NewRequest() *resty.Request {
-	c.Request = c.Client.R()
-	return c.Request
+	req := c.Client.R()
+	c.requestMu.Lock()
+	c.Request = req
+	c.requestMu.Unlock()
+	return req
 }
 
 func (c *Pan115Client) GetRequest() *resty.Request {
+	c.requestMu.Lock()
+	defer c.requestMu.Unlock()
 	if c.Request != nil {
 		return c.Request
 	}
-	return c.NewRequest()
+	c.Request = c.Client.R()
+	return c.Request
 }

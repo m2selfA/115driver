@@ -1,6 +1,9 @@
 package driver
 
 import (
+	stderrors "errors"
+	"fmt"
+	"net/url"
 	"strconv"
 	"strings"
 
@@ -45,6 +48,10 @@ var (
 	ErrInvalidCursor = errors.New("invalid cursor")
 
 	ErrUploadTooLarge = errors.New("upload reach the limit")
+
+	// ErrUploadNotAllowed means the upload-info endpoint explicitly reports
+	// that the current account is not allowed to upload.
+	ErrUploadNotAllowed = errors.New("upload is not allowed")
 
 	ErrUploadFailed = errors.New("upload failed")
 
@@ -160,12 +167,54 @@ type ResultWithErr interface {
 	Err(respBody ...string) error
 }
 
-func CheckErr(err error, result ResultWithErr, restyResp *resty.Response) error {
+// sanitizeHTTPError removes query strings, fragments, and URL userinfo from
+// network errors before they cross the driver boundary. 115 request URLs can
+// carry credentials, signed tokens, or share receive codes in their query.
+func sanitizeHTTPError(err error) error {
 	if err == nil {
-		err = result.Err(restyResp.String())
+		return nil
 	}
-	if err != nil {
+	var urlErr *url.Error
+	if !stderrors.As(err, &urlErr) {
 		return err
 	}
+	sanitized := *urlErr
+	parsed, parseErr := url.Parse(urlErr.URL)
+	if parseErr != nil {
+		sanitized.URL = "[redacted]"
+		return &sanitized
+	}
+	parsed.RawQuery = ""
+	parsed.ForceQuery = false
+	parsed.Fragment = ""
+	parsed.User = nil
+	sanitized.URL = parsed.String()
+	if urlErr.Err != nil && urlErr.Err != err {
+		sanitized.Err = sanitizeHTTPError(urlErr.Err)
+	}
+	return &sanitized
+}
+
+func validateRestyHTTPStatus(resp *resty.Response) error {
+	if resp == nil {
+		return ErrUnexpected
+	}
+	status := resp.StatusCode()
+	if status < 200 || status >= 300 {
+		return fmt.Errorf("HTTP status %d: %w", status, ErrUnexpected)
+	}
 	return nil
+}
+
+func CheckErr(err error, result ResultWithErr, restyResp *resty.Response) error {
+	if err = sanitizeHTTPError(err); err != nil {
+		return err
+	}
+	if result == nil {
+		return ErrUnexpected
+	}
+	if err := validateRestyHTTPStatus(restyResp); err != nil {
+		return err
+	}
+	return result.Err(restyResp.String())
 }

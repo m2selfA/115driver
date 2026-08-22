@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"net/url"
 	"strconv"
+	"strings"
 )
 
 // CleanRecycleBin clean the recycle bin
@@ -11,6 +12,9 @@ func (c *Pan115Client) CleanRecycleBin(password string, rIDs ...string) error {
 	form := url.Values{}
 	form.Set("password", password)
 	for idx, rID := range rIDs {
+		if strings.TrimSpace(rID) == "" {
+			return fmt.Errorf("recycle id at index %d is empty: %w", idx, ErrWrongParams)
+		}
 		form.Add(fmt.Sprintf("rid[%d]", idx), rID)
 	}
 	result := BasicResp{}
@@ -23,8 +27,30 @@ func (c *Pan115Client) CleanRecycleBin(password string, rIDs ...string) error {
 	return CheckErr(err, &result, resp)
 }
 
+func validateRecycleItems(items []RecycleBinItem) error {
+	for i := range items {
+		item := &items[i]
+		if strings.TrimSpace(item.FileId) == "" {
+			return fmt.Errorf("recycle item %d has no id: %w", i, ErrUnexpected)
+		}
+		if int64(item.FileSize) < 0 {
+			return fmt.Errorf("recycle item %d has negative size: %w", i, ErrUnexpected)
+		}
+		if int64(item.DeleteTime) < 0 {
+			return fmt.Errorf("recycle item %d has negative delete time: %w", i, ErrUnexpected)
+		}
+	}
+	return nil
+}
+
 // ListRecycleBin list the recycle bin
 func (c *Pan115Client) ListRecycleBin(offset, limit int) ([]RecycleBinItem, error) {
+	if offset < 0 {
+		return nil, fmt.Errorf("recycle offset must not be negative: %w", ErrWrongParams)
+	}
+	if limit <= 0 {
+		return nil, fmt.Errorf("recycle limit must be positive: %w", ErrWrongParams)
+	}
 	result := RecycleListResponse{}
 	req := c.NewRequest().
 		SetQueryParams(map[string]string{
@@ -40,6 +66,9 @@ func (c *Pan115Client) ListRecycleBin(offset, limit int) ([]RecycleBinItem, erro
 	resp, err := req.Get(ApiRecycleList)
 	err = CheckErr(err, &result, resp)
 	if err != nil {
+		return nil, err
+	}
+	if err := validateRecycleItems(result.Data); err != nil {
 		return nil, err
 	}
 	return result.Data, nil
@@ -63,6 +92,9 @@ type RecycleBinItem struct {
 func (c *Pan115Client) RevertRecycleBin(rIDs ...string) error {
 	form := url.Values{}
 	for idx, rID := range rIDs {
+		if strings.TrimSpace(rID) == "" {
+			return fmt.Errorf("recycle id at index %d is empty: %w", idx, ErrWrongParams)
+		}
 		form.Add(fmt.Sprintf("rid[%d]", idx), rID)
 	}
 	result := BasicResp{}

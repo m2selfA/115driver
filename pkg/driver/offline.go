@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/url"
 	"strconv"
+	"strings"
 
 	crypto "github.com/SheltonZhu/115driver/pkg/crypto/m115"
 )
@@ -60,9 +61,33 @@ func (t *OfflineTask) GetStatus() string {
 	return fmt.Sprintf("未知状态: %d", t.Status)
 }
 
+func validateOfflineTaskPage(result *OfflineTaskResp, requestedPage int64) error {
+	if result == nil {
+		return fmt.Errorf("offline task list returned no response: %w", ErrUnexpected)
+	}
+	if result.Total < 0 || result.Count < 0 || result.PageRow < 0 || result.PageCount < 0 || result.Page < 0 {
+		return fmt.Errorf("offline task list returned negative pagination metadata: %w", ErrUnexpected)
+	}
+	if result.Page > 0 && result.Page != requestedPage {
+		return fmt.Errorf("offline task list returned page %d for requested page %d: %w", result.Page, requestedPage, ErrUnexpected)
+	}
+	if result.Page > 0 && result.PageCount > 0 && result.Page > result.PageCount {
+		return fmt.Errorf("offline task list returned page %d beyond page_count %d: %w", result.Page, result.PageCount, ErrUnexpected)
+	}
+	for i, task := range result.Tasks {
+		if task == nil {
+			return fmt.Errorf("offline task list returned null task at index %d: %w", i, ErrUnexpected)
+		}
+	}
+	return nil
+}
+
 // ListOfflineTask list tasks
 func (c *Pan115Client) ListOfflineTask(page int64) (OfflineTaskResp, error) {
 	result := OfflineTaskResp{}
+	if page <= 0 {
+		return result, fmt.Errorf("offline task page must be positive: %w", ErrWrongParams)
+	}
 	if isCalledByAlistV3() {
 		return result, ErrorNotSupportAlist
 	}
@@ -74,6 +99,9 @@ func (c *Pan115Client) ListOfflineTask(page int64) (OfflineTaskResp, error) {
 	resp, err := req.Post(ApiListOfflineUrl)
 
 	if err := CheckErr(err, &result, resp); err != nil {
+		return OfflineTaskResp{}, err
+	}
+	if err := validateOfflineTaskPage(&result, page); err != nil {
 		return OfflineTaskResp{}, err
 	}
 	return result, nil
@@ -88,11 +116,18 @@ func (c *Pan115Client) AddOfflineTaskURIs(uris []string, saveDirID string, opts 
 	opt := DefaultOfflineOptions()
 
 	for _, o := range opts {
-		o(&opt)
+		if o != nil {
+			o(&opt)
+		}
 	}
 	count := len(uris)
 	if count == 0 {
 		return
+	}
+	for _, uri := range uris {
+		if strings.TrimSpace(uri) == "" {
+			return nil, fmt.Errorf("offline task URL is empty: %w", ErrWrongParams)
+		}
 	}
 
 	if c.UserID <= 0 {
@@ -140,16 +175,12 @@ func (c *Pan115Client) AddOfflineTaskURIs(uris []string, saveDirID string, opts 
 		return nil, err
 	}
 
-	taskInfos := OfflineAddUrlResponse{}
+	taskInfos := offlineAddURLWireResponse{}
 	if err := json.Unmarshal(bytes, &taskInfos); err != nil {
 		return nil, err
 	}
 
-	hashes = make([]string, count)
-	for i, task := range taskInfos.Result {
-		hashes[i] = task.InfoHash
-	}
-	return hashes, nil
+	return collectOfflineTaskHashes(taskInfos, count)
 }
 
 // DeleteOfflineTasks deletes tasks.
@@ -157,8 +188,15 @@ func (c *Pan115Client) DeleteOfflineTasks(hashes []string, deleteFiles bool) err
 	if isCalledByAlistV3() {
 		return ErrorNotSupportAlist
 	}
+	if len(hashes) == 0 {
+		return fmt.Errorf("offline task hashes are empty: %w", ErrWrongParams)
+	}
 	form := url.Values{}
 	for _, hash := range hashes {
+		hash = strings.TrimSpace(hash)
+		if hash == "" {
+			return fmt.Errorf("offline task hash is empty: %w", ErrWrongParams)
+		}
 		form.Add("hash", hash)
 	}
 
@@ -199,6 +237,56 @@ type OfflineAddUrlResponse struct {
 type OfflineTaskResponse struct {
 	InfoHash string `json:"info_hash"`
 	Url      string `json:"url"`
+}
+
+// offlineTaskWireResponse carries response-only diagnostics used to prove that
+// every requested URI was accepted. Keeping these fields private preserves the
+// v0.1.4 OfflineTaskResponse source layout for library callers.
+type offlineTaskWireResponse struct {
+	OfflineTaskResponse
+	Name      string `json:"name"`
+	State     *bool  `json:"state"`
+	ErrCode   int    `json:"errcode"`
+	ErrorCode int    `json:"error_code"`
+	ErrorMsg  string `json:"error_msg"`
+	Error     string `json:"error"`
+}
+
+type offlineAddURLWireResponse struct {
+	BasicResp
+	Result []offlineTaskWireResponse `json:"result"`
+}
+
+func collectOfflineTaskHashes(resp offlineAddURLWireResponse, expected int) ([]string, error) {
+	if len(resp.Result) != expected {
+		return nil, fmt.Errorf("offline add returned %d results for %d URLs: %w", len(resp.Result), expected, ErrUnexpected)
+	}
+	hashes := make([]string, expected)
+	for i, task := range resp.Result {
+		code := findNonZero(task.ErrCode, task.ErrorCode)
+		if task.State != nil && !*task.State {
+			if code != 0 {
+				return nil, fmt.Errorf("offline add result %d failed: %w", i, GetErr(code))
+			}
+			message := strings.TrimSpace(task.ErrorMsg)
+			if message == "" {
+				message = strings.TrimSpace(task.Error)
+			}
+			if message != "" {
+				return nil, fmt.Errorf("offline add result %d failed: %s: %w", i, message, ErrUnexpected)
+			}
+			return nil, fmt.Errorf("offline add result %d reported failure: %w", i, ErrUnexpected)
+		}
+		hash := strings.TrimSpace(task.InfoHash)
+		if hash == "" {
+			if code != 0 {
+				return nil, fmt.Errorf("offline add result %d has no info hash: %w", i, GetErr(code))
+			}
+			return nil, fmt.Errorf("offline add result %d has no info hash: %w", i, ErrUnexpected)
+		}
+		hashes[i] = hash
+	}
+	return hashes, nil
 }
 
 type OfflineTaskResp struct {

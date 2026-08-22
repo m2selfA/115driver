@@ -11,8 +11,8 @@ func ExamplePan115Client_ImportCredential() {
 		log.Fatalf("Import credentail error: %s", err)
 	}
 	client := Default().ImportCredential(cr)
-	if err := client.LoginCheck(); err != nil {
-		log.Fatalf("Login error: %s", err)
+	if err := client.CookieCheck(); err != nil {
+		log.Fatalf("Cookie validation error: %s", err)
 	}
 }
 

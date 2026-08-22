@@ -1,7 +1,9 @@
 package driver
 
 import (
+	"fmt"
 	"strconv"
+	"strings"
 )
 
 // SearchOption defines options for search
@@ -88,8 +90,67 @@ type SearchResult struct {
 	IsAsc int `json:"is_asc"`
 }
 
+func validateSearchOptions(opts *SearchOption) (offset, limit int, err error) {
+	offset, limit = 0, 30
+	if opts == nil {
+		return offset, limit, nil
+	}
+	if opts.Offset < 0 {
+		return 0, 0, fmt.Errorf("search offset must not be negative: %w", ErrWrongParams)
+	}
+	if opts.Limit < 0 {
+		return 0, 0, fmt.Errorf("search limit must not be negative: %w", ErrWrongParams)
+	}
+	if opts.Type < 0 || opts.Type > 6 {
+		return 0, 0, fmt.Errorf("search type must be between 0 and 6: %w", ErrWrongParams)
+	}
+	if opts.CountFolders < 0 || opts.CountFolders > 1 {
+		return 0, 0, fmt.Errorf("search count_folders must be 0 or 1: %w", ErrWrongParams)
+	}
+	if opts.Asc != 0 && opts.Asc != 1 {
+		return 0, 0, fmt.Errorf("search asc must be 0 or 1: %w", ErrWrongParams)
+	}
+	offset = opts.Offset
+	if opts.Limit > 0 {
+		limit = opts.Limit
+	}
+	return offset, limit, nil
+}
+
+func validateSearchResponse(result *FileListResp, offset, limit int) error {
+	if result == nil {
+		return fmt.Errorf("search returned no response: %w", ErrUnexpected)
+	}
+	if result.Count < 0 || result.Offset < 0 {
+		return fmt.Errorf("search returned negative pagination metadata: %w", ErrUnexpected)
+	}
+	if result.Count > offset && result.Offset != offset {
+		return fmt.Errorf("search response offset mismatch: requested=%d response=%d count=%d: %w", offset, result.Offset, result.Count, ErrUnexpected)
+	}
+	if len(result.Files) > limit {
+		return fmt.Errorf("search returned %d entries for limit %d: %w", len(result.Files), limit, ErrUnexpected)
+	}
+	if len(result.Files) > 0 && offset+len(result.Files) > result.Count {
+		return fmt.Errorf("search result count is inconsistent: offset=%d returned=%d count=%d: %w", offset, len(result.Files), result.Count, ErrUnexpected)
+	}
+	for i := range result.Files {
+		file := &result.Files[i]
+		if strings.TrimSpace(file.FileID) == "" && strings.TrimSpace(string(file.CategoryID)) == "" {
+			return fmt.Errorf("search result %d has no file or directory id: %w", i, ErrUnexpected)
+		}
+		if int64(file.Size) < 0 {
+			return fmt.Errorf("search result %d has negative size: %w", i, ErrUnexpected)
+		}
+	}
+	return nil
+}
+
 // Search searches for files using given options
 func (c *Pan115Client) Search(opts *SearchOption) (*SearchResult, error) {
+	requestedOffset, requestedLimit, err := validateSearchOptions(opts)
+	if err != nil {
+		return nil, err
+	}
 	result := FileListResp{}
 	params := map[string]string{
 		"aid":           "7",
@@ -155,6 +216,9 @@ func (c *Pan115Client) Search(opts *SearchOption) (*SearchResult, error) {
 
 	resp, err := req.Get(ApiFileSearch)
 	if err = CheckErr(err, &result, resp); err != nil {
+		return nil, err
+	}
+	if err := validateSearchResponse(&result, requestedOffset, requestedLimit); err != nil {
 		return nil, err
 	}
 

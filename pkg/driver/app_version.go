@@ -1,5 +1,7 @@
 package driver
 
+import "sort"
+
 // GetAppVersion get app version (win, android, mac, mac_arc, etc...)
 func (c *Pan115Client) GetAppVersion() ([]AppVersion, error) {
 	result := VersionResp{}
@@ -26,13 +28,14 @@ type VersionResp struct {
 type Versions map[string]map[string]any
 
 func (v Versions) GetAppVersions() []AppVersion {
-	vers := make([]AppVersion, len(v))
-	for app, ver := range v {
-		vers = append(vers, AppVersion{
-			AppName: app,
-			Version: ver["version_code"].(string),
-		})
+	vers := make([]AppVersion, 0, len(v))
+	for app, metadata := range v {
+		version, _ := metadata["version_code"].(string)
+		vers = append(vers, AppVersion{AppName: app, Version: version})
 	}
+	sort.Slice(vers, func(i, j int) bool {
+		return vers[i].AppName < vers[j].AppName
+	})
 	return vers
 }
 

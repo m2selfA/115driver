@@ -2,11 +2,13 @@ package driver
 
 import (
 	"bytes"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/go-resty/resty/v2"
@@ -156,6 +158,98 @@ func TestEmptyUAHandling(t *testing.T) {
 		}
 		assertNoUA(t, tr.wireUAs, *serverUAs)
 	})
+}
+
+func TestConcurrentRequestsKeepUserAgentStateRequestLocal(t *testing.T) {
+	const requestCount = 32
+	type observation struct {
+		id string
+		ua string
+	}
+	var (
+		mu           sync.Mutex
+		observations = make([]observation, 0, requestCount)
+	)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		observations = append(observations, observation{id: r.Header.Get("X-Request-ID"), ua: r.Header.Get("User-Agent")})
+		mu.Unlock()
+		_, _ = io.Copy(io.Discard, r.Body)
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}))
+	defer server.Close()
+
+	client := New()
+	client.SetUserAgent("")
+	var wg sync.WaitGroup
+	errs := make(chan error, requestCount)
+	for i := 0; i < requestCount; i++ {
+		wg.Add(1)
+		go func(index int) {
+			defer wg.Done()
+			id := fmt.Sprintf("request-%02d", index)
+			req := client.NewRequest().SetHeader("X-Request-ID", id)
+			wantUA := ""
+			if index%2 == 1 {
+				wantUA = fmt.Sprintf("sync-test/%d", index)
+				req.SetHeader("User-Agent", wantUA)
+			}
+			resp, err := req.Post(server.URL)
+			if err != nil {
+				errs <- fmt.Errorf("%s: %w", id, err)
+				return
+			}
+			if got := sentRequestHeaders(resp).Get("User-Agent"); got != wantUA {
+				errs <- fmt.Errorf("%s sent UA %q, want %q", id, got, wantUA)
+			}
+		}(i)
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	mu.Lock()
+	gotObservations := append([]observation(nil), observations...)
+	mu.Unlock()
+	if len(gotObservations) != requestCount {
+		t.Fatalf("server observed %d request(s), want %d", len(gotObservations), requestCount)
+	}
+	seen := make(map[string]string, requestCount)
+	for _, got := range gotObservations {
+		if _, duplicate := seen[got.id]; duplicate {
+			t.Fatalf("duplicate request id observed: %q", got.id)
+		}
+		seen[got.id] = got.ua
+	}
+	for i := 0; i < requestCount; i++ {
+		id := fmt.Sprintf("request-%02d", i)
+		wantUA := ""
+		if i%2 == 1 {
+			wantUA = fmt.Sprintf("sync-test/%d", i)
+		}
+		if got, ok := seen[id]; !ok || got != wantUA {
+			t.Fatalf("server request %q UA=%q present=%v, want %q", id, got, ok, wantUA)
+		}
+	}
+	if got := client.Client.Header.Get("User-Agent"); got != "" {
+		t.Fatalf("client-level User-Agent mutated by concurrent requests: %q", got)
+	}
+}
+
+func TestNewRequestKeepsLegacyLastRequestWithoutReusingRequestObjects(t *testing.T) {
+	client := New()
+	first := client.NewRequest()
+	second := client.NewRequest()
+	if first == second {
+		t.Fatal("NewRequest reused a request object")
+	}
+	if got := client.GetRequest(); got != second {
+		t.Fatalf("GetRequest returned %p, want most recent request %p", got, second)
+	}
 }
 
 func TestSafeDebugLoggingDoesNotExposeCredentials(t *testing.T) {

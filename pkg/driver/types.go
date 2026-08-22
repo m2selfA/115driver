@@ -2,6 +2,7 @@ package driver
 
 import (
 	"encoding/json"
+	"io"
 	"strconv"
 	"time"
 )
@@ -10,11 +11,14 @@ import (
 type StringInt int64
 
 func (v *StringInt) UnmarshalJSON(b []byte) (err error) {
+	if len(b) == 0 {
+		return io.ErrUnexpectedEOF
+	}
 	var i int
 	if b[0] == '"' {
 		var s string
 		if err = json.Unmarshal(b, &s); err == nil {
-			i, _ = strconv.Atoi(s)
+			i, err = strconv.Atoi(s)
 		}
 	} else {
 		err = json.Unmarshal(b, &i)
@@ -29,6 +33,9 @@ func (v *StringInt) UnmarshalJSON(b []byte) (err error) {
 type StringInt64 int64
 
 func (v *StringInt64) UnmarshalJSON(b []byte) (err error) {
+	if len(b) == 0 {
+		return io.ErrUnexpectedEOF
+	}
 	var i int64
 	if b[0] == '"' {
 		var s string
@@ -48,6 +55,9 @@ func (v *StringInt64) UnmarshalJSON(b []byte) (err error) {
 type StringFloat64 float64
 
 func (v *StringFloat64) UnmarshalJSON(b []byte) (err error) {
+	if len(b) == 0 {
+		return io.ErrUnexpectedEOF
+	}
 	var f float64
 	if b[0] == '"' {
 		var s string
@@ -66,6 +76,9 @@ func (v *StringFloat64) UnmarshalJSON(b []byte) (err error) {
 type IntString string
 
 func (v *IntString) UnmarshalJSON(b []byte) (err error) {
+	if len(b) == 0 {
+		return io.ErrUnexpectedEOF
+	}
 	var s string
 	if b[0] == '"' {
 		err = json.Unmarshal(b, &s)
@@ -84,6 +97,9 @@ func (v *IntString) UnmarshalJSON(b []byte) (err error) {
 type BoolInt int
 
 func (v *BoolInt) UnmarshalJSON(b []byte) (err error) {
+	if len(b) == 0 {
+		return io.ErrUnexpectedEOF
+	}
 	if b[0] == 'f' || b[0] == 'F' {
 		*v = -1
 	} else {
@@ -105,6 +121,9 @@ func BoolToInt(b bool) int {
 type StringTime int64
 
 func (v *StringTime) UnmarshalJSON(b []byte) (err error) {
+	if len(b) == 0 {
+		return io.ErrUnexpectedEOF
+	}
 	var t time.Time
 	if b[0] == '"' {
 		var s string

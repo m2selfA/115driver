@@ -3,13 +3,26 @@ package driver
 import (
 	"fmt"
 	"strconv"
+	"strings"
 	"time"
 )
+
+func validateNonBlankIDs(kind string, ids []string) error {
+	for i, id := range ids {
+		if strings.TrimSpace(id) == "" {
+			return fmt.Errorf("%s id at index %d is empty: %w", kind, i, ErrWrongParams)
+		}
+	}
+	return nil
+}
 
 // Delete delete files or directory from file ids
 func (c *Pan115Client) Delete(fileIDs ...string) error {
 	if len(fileIDs) == 0 {
 		return nil
+	}
+	if err := validateNonBlankIDs("file", fileIDs); err != nil {
+		return err
 	}
 	form := map[string]string{}
 	for i, value := range fileIDs {
@@ -30,6 +43,12 @@ func (c *Pan115Client) Delete(fileIDs ...string) error {
 func (c *Pan115Client) Rename(fileID, newName string) error {
 	if isCalledByAlistV3() {
 		return ErrorNotSupportAlist
+	}
+	if err := validateNonBlankIDs("file", []string{fileID}); err != nil {
+		return err
+	}
+	if newName == "" {
+		return fmt.Errorf("new file name is empty: %w", ErrWrongParams)
 	}
 	form := map[string]string{
 		"fid":       fileID,
@@ -54,6 +73,12 @@ func (c *Pan115Client) Move(dirID string, fileIDs ...string) error {
 	if len(fileIDs) == 0 {
 		return nil
 	}
+	if err := validateNonBlankIDs("destination directory", []string{dirID}); err != nil {
+		return err
+	}
+	if err := validateNonBlankIDs("file", fileIDs); err != nil {
+		return err
+	}
 	form := map[string]string{
 		"pid": dirID,
 	}
@@ -77,6 +102,12 @@ func (c *Pan115Client) Copy(dirID string, fileIDs ...string) error {
 	}
 	if len(fileIDs) == 0 {
 		return nil
+	}
+	if err := validateNonBlankIDs("destination directory", []string{dirID}); err != nil {
+		return err
+	}
+	if err := validateNonBlankIDs("file", fileIDs); err != nil {
+		return err
 	}
 	form := map[string]string{
 		"pid": dirID,
@@ -129,6 +160,9 @@ type DirInfo struct {
 
 // Stat get statistic information of a file or directory
 func (c *Pan115Client) Stat(fileID string) (*FileStatInfo, error) {
+	if strings.TrimSpace(fileID) == "" {
+		return nil, fmt.Errorf("stat file id is empty: %w", ErrWrongParams)
+	}
 	result := FileStatResponse{}
 	req := c.NewRequest().
 		SetQueryParam("cid", fileID).
@@ -137,6 +171,9 @@ func (c *Pan115Client) Stat(fileID string) (*FileStatInfo, error) {
 	resp, err := req.Get(ApiFileStat)
 	if err := CheckErr(err, &result, resp); err != nil {
 		return nil, err
+	}
+	if result.IsFile != 0 && result.IsFile != 1 {
+		return nil, fmt.Errorf("stat response has invalid file category %d: %w", result.IsFile, ErrUnexpected)
 	}
 	info := &FileStatInfo{
 		Name:       result.FileName,
@@ -148,11 +185,15 @@ func (c *Pan115Client) Stat(fileID string) (*FileStatInfo, error) {
 	}
 	// Fill parents
 	info.Parents = make([]*DirInfo, len(result.Paths))
-	for i, path := range result.Paths {
-		info.Parents[i] = &DirInfo{
+	info.Parents = info.Parents[:0]
+	for _, path := range result.Paths {
+		if path == nil {
+			continue
+		}
+		info.Parents = append(info.Parents, &DirInfo{
 			ID:   strconv.FormatInt(int64(path.FileID), 10),
 			Name: path.FileName,
-		}
+		})
 	}
 	// Directory info
 	info.IsDirectory = result.IsFile == 0
@@ -165,6 +206,10 @@ func (c *Pan115Client) Stat(fileID string) (*FileStatInfo, error) {
 
 // GetFile gets information of a file or directory by its ID.
 func (c *Pan115Client) GetFile(fileID string) (*File, error) {
+	fileID = strings.TrimSpace(fileID)
+	if fileID == "" {
+		return nil, fmt.Errorf("get file id is empty: %w", ErrWrongParams)
+	}
 	result := GetFileInfoResponse{}
 	req := c.NewRequest().
 		SetQueryParam("file_id", fileID).
@@ -174,9 +219,22 @@ func (c *Pan115Client) GetFile(fileID string) (*File, error) {
 	if err := CheckErr(err, &result, resp); err != nil {
 		return nil, err
 	}
-	fileInfo := &FileInfo{}
-	if len(result.Files) > 0 {
-		fileInfo = result.Files[0]
+	if len(result.Files) == 0 || result.Files[0] == nil {
+		return nil, fmt.Errorf("get file %q: %w", fileID, ErrNotExist)
+	}
+	fileInfo := result.Files[0]
+	responseID := strings.TrimSpace(fileInfo.FileID)
+	if responseID == "" {
+		responseID = strings.TrimSpace(string(fileInfo.CategoryID))
+	}
+	if responseID == "" {
+		return nil, fmt.Errorf("get file %q returned object without an id: %w", fileID, ErrUnexpected)
+	}
+	if responseID != fileID {
+		return nil, fmt.Errorf("get file id mismatch: requested=%q response=%q: %w", fileID, responseID, ErrUnexpected)
+	}
+	if int64(fileInfo.Size) < 0 {
+		return nil, fmt.Errorf("get file %q returned negative size: %w", fileID, ErrUnexpected)
 	}
 	f := &File{}
 	f.from(fileInfo)

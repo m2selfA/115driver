@@ -25,7 +25,11 @@ func (c *Pan115Client) Mkdir(parentID string, name string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return string(result.CategoryID), nil
+	categoryID := strings.TrimSpace(string(result.CategoryID))
+	if categoryID == "" || categoryID == "0" {
+		return "", fmt.Errorf("mkdir returned invalid directory id: %w", ErrUnexpected)
+	}
+	return categoryID, nil
 }
 
 // List list all files and directories
@@ -40,13 +44,18 @@ func (c *Pan115Client) ListWithLimit(dirID string, limit int64, opts ...ListOpti
 	if isCalledByAlistV3() {
 		return nil, ErrorNotSupportAlist
 	}
+	if limit <= 0 {
+		return nil, fmt.Errorf("file-list limit must be positive: %w", ErrWrongParams)
+	}
 	if limit > MaxDirPageLimit {
 		limit = MaxDirPageLimit
 	}
 
 	o := DefaultListOptions()
 	for _, opt := range opts {
-		opt(o)
+		if opt != nil {
+			opt(o)
+		}
 	}
 	if len(o.ApiURLs) == 0 {
 		return nil, fmt.Errorf("no file-list API endpoints configured")
@@ -58,7 +67,7 @@ func (c *Pan115Client) ListWithLimit(dirID string, limit int64, opts ...ListOpti
 		offset := int64(0)
 		for {
 			req := c.NewRequest().ForceContentType("application/json;charset=UTF-8")
-			result, err := GetFiles(req, dirID, WithApiURL(apiURL), WithLimit(limit), WithOffset(offset))
+			result, err := GetFiles(req, dirID, WithApiURL(apiURL), WithLimit(limit), WithOffset(offset), withRecordOpenTime(o.recordOpenTime))
 			if err != nil {
 				lastErr = err
 				break
@@ -92,9 +101,20 @@ func (c *Pan115Client) ListWithLimit(dirID string, limit int64, opts ...ListOpti
 
 // ListPage list files and directories with page
 func (c *Pan115Client) ListPage(dirID string, offset, limit int64, opts ...ListOption) (*[]File, error) {
+	if offset < 0 {
+		return nil, fmt.Errorf("file-list offset must not be negative: %w", ErrWrongParams)
+	}
+	if limit <= 0 {
+		return nil, fmt.Errorf("file-list limit must be positive: %w", ErrWrongParams)
+	}
+	if limit > MaxDirPageLimit {
+		limit = MaxDirPageLimit
+	}
 	o := DefaultListOptions()
 	for _, opt := range opts {
-		opt(o)
+		if opt != nil {
+			opt(o)
+		}
 	}
 	if len(o.ApiURLs) == 0 {
 		return nil, fmt.Errorf("no file-list API endpoints configured")
@@ -103,7 +123,7 @@ func (c *Pan115Client) ListPage(dirID string, offset, limit int64, opts ...ListO
 	var lastErr error
 	for _, apiURL := range o.ApiURLs {
 		req := c.NewRequest().ForceContentType("application/json;charset=UTF-8")
-		result, err := GetFiles(req, dirID, WithApiURL(apiURL), WithLimit(limit), WithOffset(offset))
+		result, err := GetFiles(req, dirID, WithApiURL(apiURL), WithLimit(limit), WithOffset(offset), withRecordOpenTime(o.recordOpenTime))
 		if err != nil {
 			lastErr = err
 			continue
@@ -127,13 +147,60 @@ func (c *Pan115Client) ListPage(dirID string, offset, limit int64, opts ...ListO
 	return nil, lastErr
 }
 
+func validateFileListResponse(result *FileListResp, dirID string, offset, limit int64) error {
+	if result == nil {
+		return fmt.Errorf("file-list returned no response: %w", ErrUnexpected)
+	}
+	if result.Count < 0 || result.Offset < 0 || result.Limit < 0 || result.PageSize < 0 {
+		return fmt.Errorf("file-list returned negative pagination metadata: %w", ErrUnexpected)
+	}
+	if dirID != string(result.CategoryID) {
+		return fmt.Errorf("file-list response directory mismatch: requested=%s response=%s: %w", dirID, result.CategoryID, ErrUnexpected)
+	}
+	if int64(len(result.Files)) > limit {
+		return fmt.Errorf("file-list returned %d entries for limit %d: %w", len(result.Files), limit, ErrUnexpected)
+	}
+	if len(result.Files) > 0 {
+		if int64(result.Offset) != offset {
+			return fmt.Errorf("file-list response offset mismatch: requested=%d response=%d count=%d: %w", offset, result.Offset, result.Count, ErrUnexpected)
+		}
+		if int64(result.Offset)+int64(len(result.Files)) > int64(result.Count) {
+			return fmt.Errorf("file-list response count is inconsistent: offset=%d returned=%d count=%d: %w", result.Offset, len(result.Files), result.Count, ErrUnexpected)
+		}
+	}
+	for i := range result.Files {
+		file := &result.Files[i]
+		if strings.TrimSpace(file.FileID) == "" && strings.TrimSpace(string(file.CategoryID)) == "" {
+			return fmt.Errorf("file-list result %d has no file or directory id: %w", i, ErrUnexpected)
+		}
+		if int64(file.Size) < 0 {
+			return fmt.Errorf("file-list result %d has negative size: %w", i, ErrUnexpected)
+		}
+	}
+	return nil
+}
+
 func GetFiles(req *resty.Request, dirID string, opts ...GetFileOptions) (*FileListResp, error) {
+	if req == nil {
+		return nil, fmt.Errorf("file-list request is nil: %w", ErrWrongParams)
+	}
 	if dirID == "" {
 		dirID = "0"
 	}
 	o := DefaultGetFileOptions()
 	for _, opt := range opts {
-		opt(o)
+		if opt != nil {
+			opt(o)
+		}
+	}
+	if o.pageSize <= 0 {
+		return nil, fmt.Errorf("file-list page size must be positive: %w", ErrWrongParams)
+	}
+	if o.offset < 0 {
+		return nil, fmt.Errorf("file-list offset must not be negative: %w", ErrWrongParams)
+	}
+	if strings.TrimSpace(o.apiURL) == "" {
+		return nil, fmt.Errorf("file-list API URL is empty: %w", ErrWrongParams)
 	}
 	result := FileListResp{}
 	params := map[string]string{
@@ -146,7 +213,7 @@ func GetFiles(req *resty.Request, dirID string, opts ...GetFileOptions) (*FileLi
 		"limit":            o.GetPageSize(),
 		"snap":             "0",
 		"natsort":          "0",
-		"record_open_time": "1",
+		"record_open_time": o.GetRecordOpenTime(),
 		"format":           "json",
 		"fc_mix":           "0",
 	}
@@ -159,20 +226,27 @@ func GetFiles(req *resty.Request, dirID string, opts ...GetFileOptions) (*FileLi
 	if err = CheckErr(err, &result, resp); err != nil {
 		return &FileListResp{}, err
 	}
-	if dirID != string(result.CategoryID) {
-		return &FileListResp{}, fmt.Errorf("file-list response directory mismatch: requested=%s response=%s", dirID, result.CategoryID)
+	if err := validateFileListResponse(&result, dirID, o.offset, o.pageSize); err != nil {
+		return &FileListResp{}, err
 	}
 	return &result, nil
 }
 
 func (c *Pan115Client) DirName2CID(dir string) (*APIGetDirIDResp, error) {
 	result := APIGetDirIDResp{}
-	dir = strings.TrimPrefix(dir, "/")
+	dir = strings.Trim(strings.TrimSpace(dir), "/")
+	if dir == "" {
+		return &APIGetDirIDResp{CategoryID: IntString("0")}, nil
+	}
 	req := c.NewRequest().ForceContentType("application/json;charset=UTF-8")
 	req.SetQueryParam("path", dir).SetResult(&result)
 	resp, err := req.Get(ApiDirName2CID)
 	if err = CheckErr(err, &result, resp); err != nil {
 		return nil, err
 	}
-	return &result, err
+	categoryID := strings.TrimSpace(string(result.CategoryID))
+	if categoryID == "" || categoryID == "0" {
+		return nil, fmt.Errorf("directory %q was not resolved to a valid id: %w", dir, ErrNotExist)
+	}
+	return &result, nil
 }
