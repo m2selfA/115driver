@@ -5,6 +5,7 @@ import (
 	"errors"
 	"reflect"
 	"strings"
+	"sync"
 	"testing"
 
 	syncplanpkg "github.com/SheltonZhu/115driver/internal/syncplan"
@@ -118,18 +119,26 @@ func TestExecuteContinueOnErrorBlocksFailedBranchAndRunsIndependentBranch(t *tes
 			{RelativePath: "good/child.bin", Action: "upload", Kind: "file"},
 		},
 	}
-	var calls []string
+	var (
+		callsMu sync.Mutex
+		calls   []string
+	)
+	recordCall := func(call string) {
+		callsMu.Lock()
+		calls = append(calls, call)
+		callsMu.Unlock()
+	}
 	deps := Deps{
 		Preflight: func(context.Context) error { return nil },
 		CreateRemoteDirectory: func(_ context.Context, item syncplanpkg.Item) error {
-			calls = append(calls, "mkdir:"+item.RelativePath)
+			recordCall("mkdir:" + item.RelativePath)
 			if item.RelativePath == "bad" {
 				return errors.New("synthetic failure")
 			}
 			return nil
 		},
 		UploadFile: func(_ context.Context, item syncplanpkg.Item) error {
-			calls = append(calls, "upload:"+item.RelativePath)
+			recordCall("upload:" + item.RelativePath)
 			return nil
 		},
 	}
@@ -137,8 +146,12 @@ func TestExecuteContinueOnErrorBlocksFailedBranchAndRunsIndependentBranch(t *tes
 	if err == nil || summary.Failed != 1 || summary.Blocked != 1 || summary.Succeeded != 2 {
 		t.Fatalf("continue-on-error summary=%#v err=%v", summary, err)
 	}
-	if strings.Contains(strings.Join(calls, ","), "bad/child.bin") || !strings.Contains(strings.Join(calls, ","), "good/child.bin") {
-		t.Fatalf("branch blocking calls=%v", calls)
+	callsMu.Lock()
+	callsSnapshot := append([]string(nil), calls...)
+	callsMu.Unlock()
+	joinedCalls := strings.Join(callsSnapshot, ",")
+	if strings.Contains(joinedCalls, "bad/child.bin") || !strings.Contains(joinedCalls, "good/child.bin") {
+		t.Fatalf("branch blocking calls=%v", callsSnapshot)
 	}
 }
 
