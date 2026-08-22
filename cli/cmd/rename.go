@@ -19,11 +19,11 @@ var renameCmd = &cobra.Command{
 
 		fileID, _, err := resolver.ResolvePath(client, remotePath)
 		if err != nil {
-			return &exitError{code: output.ExitNotFound, msg: err.Error()}
+			return &exitError{code: classifyRemoteError(err, output.ExitError), msg: err.Error()}
 		}
 
 		if err := client.Rename(fileID, newName); err != nil {
-			return &exitError{code: output.ExitError, msg: err.Error()}
+			return &exitError{code: classifyRemoteError(err, output.ExitError), msg: err.Error()}
 		}
 
 		printer.PrintSuccess(map[string]interface{}{

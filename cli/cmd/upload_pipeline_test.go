@@ -234,7 +234,7 @@ func TestExecuteRecursiveUploadActiveFileResumeStateBypassesFreshRemoteSkip(t *t
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, partsDir, err := deriveTransferSessionPaths("upload", root, "/remote", "")
+	sessionPath, partsDir, err := deriveTransferSessionPaths("upload", root, "/remote", "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -258,7 +258,7 @@ func TestExecuteRecursiveUploadActiveFileResumeStateBypassesFreshRemoteSkip(t *t
 		}
 		return uploadpkg.Result{SHA1: digest.SHA1, BytesUploaded: size, Resumed: true}, nil
 	}}
-	summary, err := executeRecursiveUpload(context.Background(), client, nil, root, "/remote", "root", true, true, "", uploadpkg.DefaultOptions(), deps)
+	summary, err := executeRecursiveUpload(context.Background(), client, nil, root, "/remote", "root", true, true, sessionPath, uploadpkg.DefaultOptions(), deps)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -314,10 +314,7 @@ func TestExecuteRecursiveUploadSessionSkipsCompletedFilesOnSecondRun(t *testing.
 	if _, err := os.Stat(first.SessionPath); err != nil {
 		t.Fatalf("recursive upload session not preserved: %v", err)
 	}
-	_, partsDir, err := deriveTransferSessionPaths("upload", root, "/remote", "")
-	if err != nil {
-		t.Fatal(err)
-	}
+	partsDir := filepath.Join(filepath.Dir(first.SessionPath), "parts")
 	if len(resumePaths) != 2 || resumePaths[0] == "" || resumePaths[1] == "" || filepath.Dir(resumePaths[0]) != partsDir {
 		t.Fatalf("per-file upload resume state was not rooted below session parts dir: %v", resumePaths)
 	}

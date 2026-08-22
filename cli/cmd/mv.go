@@ -9,17 +9,34 @@ import (
 	"github.com/spf13/cobra"
 )
 
+var mvDryRun bool
+
 var mvCmd = &cobra.Command{
 	Use:   "mv <source_path>... <destination_dir>",
 	Short: "Move files or directories into a destination directory",
-	Long:  "Move one or more remote files/directories into destination_dir. Moving a directory moves its complete subtree; no --recursive flag is required.",
-	Args:  cobra.MinimumNArgs(2),
+	Long:  "Move one or more remote files/directories into destination_dir. Moving a directory moves its complete subtree; no --recursive flag is required. --dry-run resolves every source ID and destination mapping without submitting a move request.",
+	Args:  transferSourceArgs,
 	RunE: func(cmd *cobra.Command, args []string) error {
-		return moveOrCopy("move", client, args[:len(args)-1], args[len(args)-1], client.Move)
+		expandedArgs, err := expandTransferSourceArgs(cmd, args)
+		if err != nil {
+			return &exitError{code: output.ExitArgs, msg: err.Error()}
+		}
+		if mvDryRun {
+			plan, err := buildMoveOrCopyPlan("move", client, expandedArgs[:len(expandedArgs)-1], expandedArgs[len(expandedArgs)-1])
+			if err != nil {
+				return err
+			}
+			printer.PrintSuccess(plan)
+			printMoveOrCopyPlan(plan)
+			return nil
+		}
+		return moveOrCopy("move", client, expandedArgs[:len(expandedArgs)-1], expandedArgs[len(expandedArgs)-1], client.Move)
 	},
 }
 
 func init() {
+	addBatchFromFileFlag(mvCmd)
+	mvCmd.Flags().BoolVar(&mvDryRun, "dry-run", false, "Plan and validate moves without changing remote data")
 	rootCmd.AddCommand(mvCmd)
 }
 
@@ -38,12 +55,16 @@ type resolvedRemoteItem struct {
 }
 
 func resolveUniqueRemoteItems(resolveClient remotePathResolveClient, paths []string) ([]resolvedRemoteItem, error) {
+	return resolveUniqueRemoteItemsWithResolver(resolver.New(resolveClient), paths)
+}
+
+func resolveUniqueRemoteItemsWithResolver(pathResolver *resolver.PathResolver, paths []string) ([]resolvedRemoteItem, error) {
 	items := make([]resolvedRemoteItem, 0, len(paths))
 	seen := make(map[string]struct{}, len(paths))
 	for _, remotePath := range paths {
-		fileID, isDir, err := resolver.ResolvePath(resolveClient, remotePath)
+		fileID, isDir, err := pathResolver.ResolvePath(remotePath)
 		if err != nil {
-			return nil, &exitError{code: output.ExitNotFound, msg: err.Error()}
+			return nil, &exitError{code: classifyRemoteError(err, output.ExitError), msg: err.Error()}
 		}
 		if _, exists := seen[fileID]; exists {
 			continue
@@ -67,11 +88,12 @@ func moveOrCopy(action string, resolveClient remotePathResolveClient, srcPaths [
 	if len(srcPaths) == 0 {
 		return &exitError{code: output.ExitArgs, msg: "at least one source path is required"}
 	}
-	dirID, err := resolver.ResolveDir(resolveClient, dstDir)
+	pathResolver := resolver.New(resolveClient)
+	dirID, err := pathResolver.ResolveDir(dstDir)
 	if err != nil {
-		return &exitError{code: output.ExitNotFound, msg: fmt.Sprintf("Destination directory not found: %s", dstDir)}
+		return &exitError{code: classifyRemoteError(err, output.ExitError), msg: fmt.Sprintf("Cannot resolve destination directory %s: %v", dstDir, err)}
 	}
-	items, err := resolveUniqueRemoteItems(resolveClient, srcPaths)
+	items, err := resolveUniqueRemoteItemsWithResolver(pathResolver, srcPaths)
 	if err != nil {
 		return err
 	}
@@ -88,7 +110,7 @@ func moveOrCopy(action string, resolveClient remotePathResolveClient, srcPaths [
 		sources = append(sources, item.Path)
 	}
 	if err := fn(dirID, fileIDs...); err != nil {
-		return &exitError{code: output.ExitError, msg: err.Error()}
+		return &exitError{code: classifyRemoteError(err, output.ExitError), msg: err.Error()}
 	}
 
 	printer.PrintSuccess(map[string]interface{}{

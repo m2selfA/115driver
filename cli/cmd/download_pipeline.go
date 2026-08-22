@@ -137,7 +137,10 @@ func executeDownloadCommand(
 
 	remoteID, isDirectory, err := resolver.ResolvePath(client, remotePath)
 	if err != nil {
-		return summary, fmt.Errorf("%w: %v", errDownloadRemoteNotFound, err)
+		if errors.Is(err, driver.ErrNotExist) {
+			return summary, fmt.Errorf("%w: %w", errDownloadRemoteNotFound, err)
+		}
+		return summary, fmt.Errorf("resolve remote path %q: %w", remotePath, err)
 	}
 	if !isDirectory && strings.TrimSpace(options.SessionPath) != "" {
 		return summary, fmt.Errorf("%w: --session is only used for recursive directory downloads", errDownloadUsage)
@@ -164,6 +167,7 @@ func executeDownloadCommand(
 		if err != nil {
 			return summary, err
 		}
+		defer treeSession.Close()
 		summary.SessionPath = treeSession.Path()
 		summary.ResumedCount = resumed
 		summary.SucceededCount = resumed
@@ -174,7 +178,7 @@ func executeDownloadCommand(
 	if len(tree.Files) == 0 {
 		summary.FailedCount = summary.FileCount - summary.SucceededCount
 		if treeSession != nil && summary.FailedCount == 0 {
-			if err := treeSession.Remove(); err != nil {
+			if err := cleanupCompletedDownloadTreeSession(treeSession); err != nil {
 				return summary, err
 			}
 			summary.SessionPath = ""
@@ -214,6 +218,23 @@ func executeDownloadCommand(
 	if treeSession == nil {
 		summary.TotalBytes = pendingBytes
 	}
+	var fileSessionResolution transferSessionResolution
+	if options.Resume {
+		if isDirectory && treeSession != nil {
+			partsDir := treeSession.PartsDir()
+			for i := range prepared {
+				prepared[i].Job.ResumeStatePath = downloadResumePathForRelative(partsDir, prepared[i].RelativePath)
+			}
+		} else if !isDirectory && len(prepared) == 1 {
+			fileSessionResolution, err = resolveTransferSessionPaths("download", "file", prepared[0].Job.DestinationPath, remotePath, options.Strategy, "single-file", "")
+			if err != nil {
+				return summary, err
+			}
+			defer fileSessionResolution.closeLock()
+			prepared[0].Job.ResumeStatePath = fileSessionResolution.SessionPath
+			summary.SessionPath = fileSessionResolution.SessionPath
+		}
+	}
 
 	jobs := make([]transfer.FileTransferJob, len(prepared))
 	remoteByJobID := make(map[string]string, len(prepared))
@@ -241,6 +262,7 @@ func executeDownloadCommand(
 				WorkersPerInterface: options.WorkersPerInterface,
 				HealthTracker:       health,
 				ResumeKey:           job.ResumeKey,
+				ResumeStatePath:     job.ResumeStatePath,
 				Refresh:             job.Refresh,
 				MaxRefreshes:        job.MaxRefreshes,
 			})
@@ -266,7 +288,12 @@ func executeDownloadCommand(
 			return summary, fmt.Errorf("%d of %d chunk downloads failed", summary.FailedCount, summary.FileCount)
 		}
 		if treeSession != nil {
-			if err := treeSession.Remove(); err != nil {
+			if err := cleanupCompletedDownloadTreeSession(treeSession); err != nil {
+				return summary, err
+			}
+			summary.SessionPath = ""
+		} else if fileSessionResolution.ManagedDir != "" {
+			if err := cleanupResolvedTransferSession(fileSessionResolution); err != nil {
 				return summary, err
 			}
 			summary.SessionPath = ""
@@ -306,7 +333,12 @@ func executeDownloadCommand(
 		return summary, scheduleErr
 	}
 	if summary.FailedCount == 0 && treeSession != nil {
-		if err := treeSession.Remove(); err != nil {
+		if err := cleanupCompletedDownloadTreeSession(treeSession); err != nil {
+			return summary, err
+		}
+		summary.SessionPath = ""
+	} else if summary.FailedCount == 0 && fileSessionResolution.ManagedDir != "" {
+		if err := cleanupResolvedTransferSession(fileSessionResolution); err != nil {
 			return summary, err
 		}
 		summary.SessionPath = ""
@@ -379,12 +411,15 @@ func collectRemoteDownloadTree(client downloadCommandClient, remoteID, remotePat
 	for len(queue) > 0 {
 		current := queue[0]
 		queue = queue[1:]
-		entries, err := client.List(current.ID)
+		entries, err := listRemoteDirectoryReadOnly(client, current.ID)
 		if err != nil {
 			return remoteDownloadTree{}, fmt.Errorf("list remote directory %q: %w", current.Remote, err)
 		}
+		if entries == nil {
+			return remoteDownloadTree{}, fmt.Errorf("list remote directory %q returned an empty response: %w", current.Remote, driver.ErrUnexpected)
+		}
 		for _, entry := range *entries {
-			if err := validateRemoteDownloadName(entry.Name); err != nil {
+			if err := validateRemoteTreeEntryName(entry.Name); err != nil {
 				return remoteDownloadTree{}, fmt.Errorf("unsafe remote entry %q below %q: %w", entry.Name, current.Remote, err)
 			}
 			relative := filepath.Join(current.Relative, entry.Name)
@@ -393,6 +428,9 @@ func collectRemoteDownloadTree(client downloadCommandClient, remoteID, remotePat
 				remoteChild = "/" + remoteChild
 			}
 			if entry.IsDirectory {
+				if strings.TrimSpace(entry.FileID) == "" {
+					return remoteDownloadTree{}, fmt.Errorf("remote directory %q has no stable ID: %w", remoteChild, driver.ErrUnexpected)
+				}
 				if _, exists := seenDirectories[entry.FileID]; exists {
 					return remoteDownloadTree{}, fmt.Errorf("remote directory ID %q was encountered more than once", entry.FileID)
 				}
@@ -408,16 +446,7 @@ func collectRemoteDownloadTree(client downloadCommandClient, remoteID, remotePat
 }
 
 func validateRemoteDownloadName(name string) error {
-	if name == "" || name == "." || name == ".." {
-		return errors.New("empty or dot path component")
-	}
-	if strings.ContainsAny(name, `/\\`) {
-		return errors.New("name contains a path separator")
-	}
-	if filepath.IsAbs(name) || filepath.VolumeName(name) != "" {
-		return errors.New("name is absolute or contains a volume prefix")
-	}
-	return nil
+	return validateRemoteTreeEntryName(name)
 }
 
 func prepareRecursiveDownloadDirectories(localTarget string, directories []string) (string, error) {

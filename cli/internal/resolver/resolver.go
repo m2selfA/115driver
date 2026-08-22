@@ -1,104 +1,37 @@
 package resolver
 
 import (
-	"fmt"
 	"os"
-	"path"
 	"path/filepath"
 	"strings"
 
-	"github.com/SheltonZhu/115driver/pkg/driver"
+	"github.com/SheltonZhu/115driver/internal/remoteresolver"
 )
 
-const RootID = "0"
+const RootID = remoteresolver.RootID
+const fileResolvePageLimit = remoteresolver.FileResolvePageLimit
 
-// TODO: add LRU cache for path resolution
+type pathResolverClient = remoteresolver.Client
+type PathResolver = remoteresolver.PathResolver
 
-type pathResolverClient interface {
-	DirName2CID(dir string) (*driver.APIGetDirIDResp, error)
-	List(dirID string, opts ...driver.ListOption) (*[]driver.File, error)
-	ListPage(dirID string, offset, limit int64, opts ...driver.ListOption) (*[]driver.File, error)
+func New(client pathResolverClient) *PathResolver {
+	return remoteresolver.New(client)
 }
 
-const fileResolvePageLimit int64 = 100
+func newPathResolver(client pathResolverClient, capacity int) *PathResolver {
+	return remoteresolver.NewWithCapacity(client, capacity)
+}
 
 func ResolveDir(client pathResolverClient, remotePath string) (string, error) {
-	if remotePath == "" || remotePath == "/" {
-		return RootID, nil
-	}
-
-	cleaned := strings.TrimPrefix(remotePath, "/")
-	cleaned = strings.TrimSuffix(cleaned, "/")
-
-	if cleaned == "" {
-		return RootID, nil
-	}
-
-	resp, err := client.DirName2CID(cleaned)
-	if err != nil {
-		return "", fmt.Errorf("directory not found: %s (%w)", remotePath, err)
-	}
-	if string(resp.CategoryID) == RootID {
-		return "", fmt.Errorf("directory not found: %s", remotePath)
-	}
-	return string(resp.CategoryID), nil
+	return remoteresolver.ResolveDir(client, remotePath)
 }
 
 func ResolveFile(client pathResolverClient, remotePath string) (string, error) {
-	cleaned := strings.TrimPrefix(remotePath, "/")
-	cleaned = strings.TrimSuffix(cleaned, "/")
-
-	dir := path.Dir(cleaned)
-	fileName := path.Base(cleaned)
-
-	var dirID string
-	if dir == "." || dir == "" {
-		dirID = RootID
-	} else {
-		var err error
-		dirID, err = ResolveDir(client, dir)
-		if err != nil {
-			return "", err
-		}
-	}
-
-	for offset := int64(0); ; offset += fileResolvePageLimit {
-		files, err := client.ListPage(dirID, offset, fileResolvePageLimit)
-		if err != nil {
-			return "", fmt.Errorf("failed to list directory: %w", err)
-		}
-		if len(*files) == 0 {
-			break
-		}
-		for _, f := range *files {
-			if f.Name == fileName && !f.IsDirectory {
-				return f.FileID, nil
-			}
-		}
-		if int64(len(*files)) < fileResolvePageLimit {
-			break
-		}
-	}
-	return "", fmt.Errorf("file not found: %s", remotePath)
+	return remoteresolver.ResolveFile(client, remotePath)
 }
 
 func ResolvePath(client pathResolverClient, remotePath string) (string, bool, error) {
-	if remotePath == "" || remotePath == "/" {
-		return RootID, true, nil
-	}
-
-	// Try as directory first
-	dirID, err := ResolveDir(client, remotePath)
-	if err == nil && dirID != "" {
-		return dirID, true, nil
-	}
-
-	// Try as file
-	fileID, fileErr := ResolveFile(client, remotePath)
-	if fileErr != nil {
-		return "", false, fmt.Errorf("%w; also tried as directory: %v", fileErr, err)
-	}
-	return fileID, false, nil
+	return remoteresolver.ResolvePath(client, remotePath)
 }
 
 func ResolveLocalDownloadPath(localTarget, fileName string) string {

@@ -2,8 +2,8 @@ package cmd
 
 import (
 	"fmt"
-	"runtime/debug"
 
+	"github.com/SheltonZhu/115driver/internal/buildinfo"
 	"github.com/spf13/cobra"
 )
 
@@ -11,25 +11,12 @@ var versionCmd = &cobra.Command{
 	Use:   "version",
 	Short: "Print the version number",
 	Run: func(cmd *cobra.Command, args []string) {
-		fmt.Println("115driver version " + resolveVersion())
+		fmt.Println("115driver version " + currentVersion())
 	},
 }
 
-func resolveVersion() string {
-	if version != "dev" {
-		return version
-	}
-	// Fallback: read commit hash from go build info (works with go install)
-	info, ok := debug.ReadBuildInfo()
-	if !ok {
-		return "dev"
-	}
-	for _, s := range info.Settings {
-		if s.Key == "vcs.revision" {
-			return "dev-" + s.Value[:7]
-		}
-	}
-	return "dev"
+func currentVersion() string {
+	return buildinfo.Version(version)
 }
 
 func init() {

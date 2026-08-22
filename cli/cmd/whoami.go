@@ -10,10 +10,11 @@ import (
 var whoamiCmd = &cobra.Command{
 	Use:   "whoami",
 	Short: "Show current authenticated user info",
+	Args:  cobra.NoArgs,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		userInfo, err := client.GetUser()
 		if err != nil {
-			return &exitError{code: output.ExitAuth, msg: fmt.Sprintf("Failed to get user info: %v", err)}
+			return &exitError{code: classifyNetworkError(err, output.ExitAuth), msg: fmt.Sprintf("Failed to get user info: %v", err)}
 		}
 
 		if jsonOutput {

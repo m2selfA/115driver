@@ -12,6 +12,7 @@ import (
 	"sort"
 	"strings"
 
+	syncplanpkg "github.com/SheltonZhu/115driver/internal/syncplan"
 	"github.com/SheltonZhu/115driver/internal/transfer"
 	uploadpkg "github.com/SheltonZhu/115driver/internal/upload"
 	"github.com/SheltonZhu/115driver/pkg/driver"
@@ -115,9 +116,16 @@ func executeRecursiveUpload(
 	treeProgress := newRecursiveUploadProgress(summary.TotalBytes, options.ProgressBytes)
 
 	var session *transfer.TransferTreeSession
+	var sessionResolution transferSessionResolution
 	partsDir := ""
 	if resume {
-		sessionPath, derivedPartsDir, err := deriveTransferSessionPaths("upload", tree.Root, remoteDir, sessionOverride)
+		transferMode := "directory"
+		if contents {
+			transferMode = "contents"
+		}
+		sessionResolution, err = resolveTransferSessionPaths("upload", "tree", tree.Root, remoteDir, "multipart", transferMode, sessionOverride)
+		sessionPath, derivedPartsDir := sessionResolution.SessionPath, sessionResolution.PartsDir
+		defer sessionResolution.closeLock()
 		if err != nil {
 			return summary, err
 		}
@@ -145,12 +153,22 @@ func executeRecursiveUpload(
 				RelativePath: file.RelativePath, Size: file.Size, ModTimeUnixNano: file.ModTimeUnixNano,
 			}
 		}
-		session, err = transfer.OpenTransferTreeSession(sessionPath, transfer.TransferTreeSessionSpec{
+		spec := transfer.TransferTreeSessionSpec{
 			Direction: "upload", Source: tree.Root, Destination: remoteDir, Strategy: "multipart",
-		}, directories, files)
+		}
+		if err := importLegacyTransferSession(&sessionResolution, func(path string) (bool, error) {
+			return transfer.ValidateTransferTreeSession(path, spec)
+		}); err != nil {
+			return summary, err
+		}
+		session, err = transfer.OpenTransferTreeSession(sessionPath, spec, directories, files)
 		if err != nil {
 			return summary, err
 		}
+		commitLegacyTransferSessionImport(sessionResolution)
+		session.AttachLock(sessionResolution.Lock)
+		sessionResolution.Lock = nil
+		defer session.Close()
 		summary.SessionPath = sessionPath
 		partsDir = derivedPartsDir
 	}
@@ -229,8 +247,10 @@ func executeRecursiveUpload(
 		if err := session.Remove(); err != nil {
 			return summary, err
 		}
-		if err := safeRemoveUploadPartsDir(partsDir); err != nil {
-			return summary, err
+		if sessionResolution.ManagedDir == "" {
+			if err := safeRemoveUploadPartsDir(partsDir); err != nil {
+				return summary, err
+			}
 		}
 		summary.SessionPath = ""
 	}
@@ -305,19 +325,7 @@ func scanLocalUploadTree(root string) (localUploadTree, error) {
 }
 
 func is115DriverTransferStateName(name string, isDir bool) bool {
-	if !strings.Contains(name, ".115driver-") {
-		return false
-	}
-	if isDir {
-		return strings.HasSuffix(name, ".session.json.parts")
-	}
-	if strings.HasSuffix(name, ".session.json") {
-		return true
-	}
-	// TransferTreeSession persists through os.CreateTemp using
-	// ".<session-basename>.*". A process crash may leave that temporary file
-	// behind, so exclude it from later recursive uploads as transfer state too.
-	return strings.Contains(name, ".session.json.")
+	return syncplanpkg.IsTransferStateName(name, isDir)
 }
 
 func uploadSourceRequestsContents(localPath string) bool {
@@ -354,7 +362,7 @@ func prepareRecursiveUploadDestination(client uploadTreeClient, remoteDir, rootI
 		return "", "", errors.New("upload tree client is nil")
 	}
 	base := pathpkg.Base(destination)
-	entries, err := client.List(rootID)
+	entries, err := listRemoteDirectoryReadOnly(client, rootID)
 	if err != nil {
 		return "", "", fmt.Errorf("list recursive upload destination %q: %w", remoteDir, err)
 	}
@@ -403,7 +411,7 @@ func ensureRemoteUploadDirectories(client uploadTreeClient, rootID string, direc
 		if !ok {
 			return nil, nil, fmt.Errorf("remote parent directory %q was not prepared", parent)
 		}
-		entries, err := client.List(parentID)
+		entries, err := listRemoteDirectoryReadOnly(client, parentID)
 		if err != nil {
 			return nil, nil, fmt.Errorf("list remote upload parent %q: %w", parent, err)
 		}
@@ -443,7 +451,7 @@ func ensureRemoteUploadDirectories(client uploadTreeClient, rootID string, direc
 		if _, ok := listings[relative]; ok {
 			continue
 		}
-		entries, err := client.List(id)
+		entries, err := listRemoteDirectoryReadOnly(client, id)
 		if err != nil {
 			return nil, nil, fmt.Errorf("list remote upload directory %q: %w", relative, err)
 		}

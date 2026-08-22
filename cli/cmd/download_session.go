@@ -5,15 +5,18 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/SheltonZhu/115driver/internal/transfer"
 )
 
 func prepareRecursiveDownloadSession(remotePath, localRoot string, tree remoteDownloadTree, strategy, override string) (*transfer.TransferTreeSession, []remoteDownloadFile, int, int64, error) {
-	sessionPath, _, err := deriveTransferSessionPaths("download", localRoot, remotePath, override)
+	sessionResolution, err := resolveTransferSessionPaths("download", "tree", localRoot, remotePath, strategy, "directory", override)
 	if err != nil {
 		return nil, nil, 0, 0, err
 	}
+	sessionPath := sessionResolution.SessionPath
+	defer sessionResolution.closeLock()
 	directories := make([]transfer.TransferTreeSessionDirectory, len(tree.Directories))
 	for i, relative := range tree.Directories {
 		directories[i] = transfer.TransferTreeSessionDirectory{RelativePath: relative}
@@ -43,12 +46,20 @@ func prepareRecursiveDownloadSession(remotePath, localRoot string, tree remoteDo
 	if inside {
 		return nil, nil, 0, 0, fmt.Errorf("%w: recursive download session must be outside the destination directory", errDownloadUsage)
 	}
-	session, err := transfer.OpenTransferTreeSession(sessionPath, transfer.TransferTreeSessionSpec{
+	spec := transfer.TransferTreeSessionSpec{
 		Direction: "download", Source: remotePath, Destination: absoluteRoot, Strategy: strategy,
-	}, directories, files)
+	}
+	if err := importLegacyTransferSession(&sessionResolution, func(path string) (bool, error) {
+		return transfer.ValidateTransferTreeSession(path, spec)
+	}); err != nil {
+		return nil, nil, 0, 0, err
+	}
+	session, err := transfer.OpenTransferTreeSession(sessionPath, spec, directories, files)
 	if err != nil {
 		return nil, nil, 0, 0, err
 	}
+	commitLegacyTransferSessionImport(sessionResolution)
+	session.SetPartsDir(sessionResolution.PartsDir)
 
 	stateByRelative := make(map[string]transfer.TransferTreeSessionFile, len(files))
 	for _, state := range session.Snapshot().Files {
@@ -83,7 +94,23 @@ func prepareRecursiveDownloadSession(remotePath, localRoot string, tree remoteDo
 		}
 		pending = append(pending, source)
 	}
+	session.AttachLock(sessionResolution.Lock)
+	sessionResolution.Lock = nil
 	return session, pending, resumed, totalBytes, nil
+}
+
+func cleanupCompletedDownloadTreeSession(session *transfer.TransferTreeSession) error {
+	if session == nil {
+		return nil
+	}
+	partsDir := session.PartsDir()
+	if err := session.Remove(); err != nil {
+		return err
+	}
+	if strings.HasSuffix(filepath.Base(partsDir), ".parts") {
+		return safeRemoveUploadPartsDir(partsDir)
+	}
+	return nil
 }
 
 func markDownloadSessionCompleted(session *transfer.TransferTreeSession, relative, destination string, expectedSize int64) error {

@@ -5,17 +5,18 @@ import (
 	"os"
 	"path/filepath"
 
+	"github.com/SheltonZhu/115driver/internal/sessionconfig"
 	"github.com/SheltonZhu/115driver/pkg/driver"
 	"github.com/spf13/viper"
 )
 
 const (
-	DefaultConfigDir  = ".115driver"
-	DefaultConfigFile = "config.toml"
-	DefaultProfile    = "main"
+	DefaultConfigDir  = sessionconfig.DefaultConfigDir
+	DefaultConfigFile = sessionconfig.DefaultConfigFile
+	DefaultProfile    = sessionconfig.DefaultProfile
 	EnvCookie         = "DRIVER115_COOKIE"
-	EnvConfig         = "DRIVER115_CONFIG"
-	EnvProfile        = "DRIVER115_PROFILE"
+	EnvConfig         = sessionconfig.EnvConfig
+	EnvProfile        = sessionconfig.EnvProfile
 	EnvDebug          = "DRIVER115_DEBUG"
 )
 
@@ -99,6 +100,14 @@ func ResolveProfile(profile string) string {
 		return envProfile
 	}
 	return DefaultProfile
+}
+
+func ResolveConfigFilePath(configPath string) string {
+	return sessionconfig.ResolveConfigFilePath(configPath)
+}
+
+func ResolveProfileName(configPath, requested string) string {
+	return sessionconfig.ResolveProfileName(configPath, requested)
 }
 
 func SaveCredential(configPath, profile, cookie string) error {

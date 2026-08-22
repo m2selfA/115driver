@@ -11,20 +11,44 @@ import (
 	"github.com/spf13/cobra"
 )
 
-var rmForce bool
+var (
+	rmForce  bool
+	rmDryRun bool
+)
 
 var rmCmd = &cobra.Command{
 	Use:   "rm <remote_path>...",
 	Short: "Delete files or directories (moves to recycle bin)",
-	Long:  "Delete one or more remote files/directories. Deleting a directory already deletes its complete subtree, so no --recursive flag is required.",
-	Args:  cobra.MinimumNArgs(1),
+	Long:  "Delete one or more remote files/directories. Deleting a directory already deletes its complete subtree, so no --recursive flag is required. --dry-run resolves IDs and recursively summarizes directory subtrees without prompting or moving anything to the recycle bin.",
+	Args:  rmInputArgs,
 	RunE: func(cmd *cobra.Command, args []string) error {
+		fromFile, err := batchFromFile(cmd)
+		if err != nil {
+			return &exitError{code: output.ExitArgs, msg: err.Error()}
+		}
+		if fromFile == "-" && !rmForce && !rmDryRun {
+			return &exitError{code: output.ExitArgs, msg: "rm --from-file - requires --force because stdin is reserved for the source list"}
+		}
+		expandedArgs, err := expandBatchInputArgs(cmd, args)
+		if err != nil {
+			return &exitError{code: output.ExitArgs, msg: err.Error()}
+		}
+		args = expandedArgs
 		items, err := resolveUniqueRemoteItems(client, args)
 		if err != nil {
 			return err
 		}
 		if err := validateRemoteMutationItems(items); err != nil {
 			return err
+		}
+		if rmDryRun {
+			plan, err := buildRemoteDeletePlanFromItems(client, items)
+			if err != nil {
+				return err
+			}
+			printer.PrintSuccess(plan)
+			printRemoteDeletePlan(plan)
+			return nil
 		}
 		hasDirectory := false
 		fileIDs := make([]string, 0, len(items))
@@ -54,7 +78,7 @@ var rmCmd = &cobra.Command{
 		}
 
 		if err := client.Delete(fileIDs...); err != nil {
-			return &exitError{code: output.ExitError, msg: err.Error()}
+			return &exitError{code: classifyRemoteError(err, output.ExitError), msg: err.Error()}
 		}
 
 		printer.PrintSuccess(map[string]interface{}{
@@ -71,8 +95,24 @@ var rmCmd = &cobra.Command{
 	},
 }
 
+func rmInputArgs(cmd *cobra.Command, args []string) error {
+	if err := batchInputArgs(cmd, args); err != nil {
+		return err
+	}
+	fromFile, err := batchFromFile(cmd)
+	if err != nil {
+		return &exitError{code: output.ExitArgs, msg: err.Error()}
+	}
+	if fromFile == "-" && !rmForce && !rmDryRun {
+		return &exitError{code: output.ExitArgs, msg: "rm --from-file - requires --force because stdin is reserved for the source list"}
+	}
+	return nil
+}
+
 func init() {
 	rmCmd.Flags().BoolVarP(&rmForce, "force", "f", false, "Skip confirmation for directory deletes")
+	rmCmd.Flags().BoolVar(&rmDryRun, "dry-run", false, "Plan deletion and summarize directory subtrees without deleting or prompting")
+	addBatchFromFileFlag(rmCmd)
 	rootCmd.AddCommand(rmCmd)
 }
 

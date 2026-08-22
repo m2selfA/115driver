@@ -9,8 +9,16 @@ import (
 	uploadpkg "github.com/SheltonZhu/115driver/internal/upload"
 )
 
-func configureCLIUploadProgress(options *uploadpkg.Options) func() {
+func configureCLIUploadProgress(options *uploadpkg.Options, sourceLabel string) func() {
 	if options == nil || jsonOutput {
+		return func() {}
+	}
+	if batchParallelActive() {
+		options.Progress = func(message string) {
+			if importantUploadStatus(message) {
+				fmt.Fprintf(os.Stderr, "[%s] %s\n", sourceLabel, message)
+			}
+		}
 		return func() {}
 	}
 	progress := output.NewTransferProgress()

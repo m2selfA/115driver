@@ -1,7 +1,6 @@
 package cmd
 
 import (
-	"errors"
 	"reflect"
 	"testing"
 
@@ -10,19 +9,38 @@ import (
 )
 
 type fakeRemotePathClient struct {
-	dirIDs map[string]string
-	lists  map[string][]driver.File
+	dirIDs    map[string]string
+	dirErrs   map[string]error
+	lists     map[string][]driver.File
+	listErrs  map[string]error
+	nilLists  map[string]bool
+	dirCalls  map[string]int
+	listCalls int
 }
 
 func (client *fakeRemotePathClient) DirName2CID(dir string) (*driver.APIGetDirIDResp, error) {
+	if client.dirCalls == nil {
+		client.dirCalls = make(map[string]int)
+	}
+	client.dirCalls[dir]++
+	if err := client.dirErrs[dir]; err != nil {
+		return nil, err
+	}
 	id, ok := client.dirIDs[dir]
 	if !ok {
-		return nil, errors.New("directory missing")
+		return nil, driver.ErrNotExist
 	}
 	return &driver.APIGetDirIDResp{CategoryID: driver.IntString(id)}, nil
 }
 
 func (client *fakeRemotePathClient) List(dirID string, _ ...driver.ListOption) (*[]driver.File, error) {
+	client.listCalls++
+	if err := client.listErrs[dirID]; err != nil {
+		return nil, err
+	}
+	if client.nilLists[dirID] {
+		return nil, nil
+	}
 	entries := append([]driver.File(nil), client.lists[dirID]...)
 	return &entries, nil
 }
@@ -47,6 +65,28 @@ func testRemotePathClient() *fakeRemotePathClient {
 		lists: map[string][]driver.File{
 			"0": {{FileID: "f-a", Name: "a.txt", Size: 1}},
 		},
+	}
+}
+
+func TestWalkRemoteTreeRejectsNilListingAndUnsafeNamesBeforeVisiting(t *testing.T) {
+	for name, client := range map[string]*fakeRemotePathClient{
+		"nil-list":             {nilLists: map[string]bool{"root": true}},
+		"unsafe-name":          {lists: map[string][]driver.File{"root": {{FileID: "f1", Name: "../escape.bin"}}}},
+		"directory-without-id": {lists: map[string][]driver.File{"root": {{Name: "sub", IsDirectory: true}}}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			visits := 0
+			_, err := walkRemoteTree(client, "root", "/root", 0, func(remoteWalkEntry) (bool, error) {
+				visits++
+				return false, nil
+			})
+			if err == nil {
+				t.Fatal("expected malformed remote tree error")
+			}
+			if visits != 0 {
+				t.Fatalf("malformed entry reached visitor %d time(s)", visits)
+			}
+		})
 	}
 }
 

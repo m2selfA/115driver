@@ -16,11 +16,11 @@ var infoCmd = &cobra.Command{
 	RunE: func(cmd *cobra.Command, args []string) error {
 		userInfo, err := client.GetUser()
 		if err != nil {
-			return &exitError{code: output.ExitAuth, msg: fmt.Sprintf("Failed to get user info: %v", err)}
+			return &exitError{code: classifyNetworkError(err, output.ExitAuth), msg: fmt.Sprintf("Failed to get user info: %v", err)}
 		}
 		info, err := client.GetInfo()
 		if err != nil {
-			return &exitError{code: output.ExitError, msg: fmt.Sprintf("Failed to get account info: %v", err)}
+			return &exitError{code: classifyNetworkError(err, output.ExitError), msg: fmt.Sprintf("Failed to get account info: %v", err)}
 		}
 
 		account := accountinfo.FromDriverData(userInfo, info)

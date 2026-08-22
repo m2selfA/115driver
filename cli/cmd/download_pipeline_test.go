@@ -13,11 +13,14 @@ import (
 	"testing"
 	"time"
 
+	"github.com/SheltonZhu/115driver/cli/internal/output"
 	"github.com/SheltonZhu/115driver/internal/transfer"
 	"github.com/SheltonZhu/115driver/pkg/driver"
 )
 
 func TestExecuteDownloadCommandRecursiveWiresP1P2P4AndPreservesTree(t *testing.T) {
+	managedRoot := filepath.Join(t.TempDir(), "sessions")
+	t.Setenv("115DRIVER_SESSION_DIR", managedRoot)
 	client := &fakeDownloadCommandClient{
 		dirIDs: map[string]string{"root": "d1"},
 		lists: map[string][]driver.File{
@@ -121,6 +124,12 @@ func TestExecuteDownloadCommandRecursiveWiresP1P2P4AndPreservesTree(t *testing.T
 	}
 	if byID["fa"].ResumeKey != "pa" || byID["fb"].ResumeKey != "pb" || byID["fa"].MaxRefreshes != transfer.DefaultDownloadURLRefreshes || byID["fa"].Refresh == nil {
 		t.Fatalf("P9 resume/refresh settings were not attached to file jobs: a=%#v b=%#v", byID["fa"], byID["fb"])
+	}
+	for _, job := range []transfer.FileTransferJob{byID["fa"], byID["fb"]} {
+		inside, err := pathIsWithin(managedRoot, job.ResumeStatePath)
+		if err != nil || !inside || filepath.Base(filepath.Dir(job.ResumeStatePath)) != "parts" || !strings.HasSuffix(filepath.Base(job.ResumeStatePath), ".download.json") {
+			t.Fatalf("recursive resume metadata was not centralized below tree parts: path=%q inside=%v err=%v", job.ResumeStatePath, inside, err)
+		}
 	}
 	for _, relative := range []string{"sub", "empty"} {
 		info, err := os.Stat(filepath.Join(root, relative))
@@ -246,10 +255,14 @@ func TestPrepareRecursiveDownloadSessionResetsCompletedFileWhenLocalCopyChanges(
 	if err := os.WriteFile(filepath.Join(root, "a.bin"), []byte("zzzz"), 0600); err != nil {
 		t.Fatal(err)
 	}
-	_, pending, resumed, _, err := prepareRecursiveDownloadSession("/root", root, remote, "file", sessionPath)
+	if err := session.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, pending, resumed, _, err := prepareRecursiveDownloadSession("/root", root, remote, "file", sessionPath)
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer reopened.Close()
 	if resumed != 0 || len(pending) != 1 {
 		t.Fatalf("changed completed file was incorrectly trusted: resumed=%d pending=%#v", resumed, pending)
 	}
@@ -307,6 +320,23 @@ func TestCollectRemoteDownloadTreeRejectsPathSeparatorsInRemoteNames(t *testing.
 	}
 }
 
+func TestCollectRemoteDownloadTreeRejectsMalformedDirectoryListings(t *testing.T) {
+	for name, client := range map[string]*fakeDownloadCommandClient{
+		"nil-list":             {nilLists: map[string]bool{"d1": true}},
+		"directory-without-id": {lists: map[string][]driver.File{"d1": {{Name: "sub", IsDirectory: true}}}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			_, err := collectRemoteDownloadTree(client, "d1", "/dir", true, true)
+			if err == nil {
+				t.Fatal("expected malformed directory listing error")
+			}
+			if client.listCalls[""] != 0 {
+				t.Fatalf("malformed directory listing fell back to root %d time(s)", client.listCalls[""])
+			}
+		})
+	}
+}
+
 func TestResolveDownloadPathSelectionAutoKeepsAllReachableAddressesForP2(t *testing.T) {
 	iface1v4 := testCLIPath("Ethernet", 1, "10.0.0.1")
 	iface1v6 := testCLIPath("Ethernet", 1, "2001:db8::1")
@@ -352,7 +382,67 @@ func TestResolveDownloadPathSelectionManualMatchesNameIndexAndIP(t *testing.T) {
 	}
 }
 
+func TestExecuteDownloadCommandSingleFileUsesManagedResumeMetadata(t *testing.T) {
+	managedRoot := filepath.Join(t.TempDir(), "sessions")
+	t.Setenv("115DRIVER_SESSION_DIR", managedRoot)
+	client := &fakeDownloadCommandClient{
+		lists: map[string][]driver.File{
+			"0": {{FileID: "fa", Name: "a.bin", PickCode: "pa", Size: 4}},
+		},
+		downloads: map[string]*driver.DownloadInfo{
+			"pa": testDriverDownloadInfo("a.bin", 4, "https://cdn.example.invalid/a"),
+		},
+	}
+	iface := testCLIPath("Ethernet", 1, "10.0.0.1")
+	var captured transfer.FileTransferJob
+	deps := downloadPipelineDeps{
+		discoverNetworkPaths: func(context.Context) (transfer.NetworkDiscoveryResult, error) {
+			return transfer.NetworkDiscoveryResult{Paths: []transfer.NetworkPath{iface}, Probes: []transfer.NetworkPathProbe{{Path: iface, Reachable: true}}}, nil
+		},
+		probeCDNPaths: func(_ context.Context, _ string, _ http.Header, _ []transfer.NetworkPath, _ *transfer.CDNProbeCache, _ ...transfer.CDNProbeOption) (transfer.CDNDiscoveryResult, error) {
+			return transfer.CDNDiscoveryResult{Host: "cdn.example.invalid", Paths: []transfer.NetworkPath{iface}}, nil
+		},
+		scheduleFiles: func(_ context.Context, _ []transfer.NetworkPath, jobs []transfer.FileTransferJob, _ ...transfer.FileSchedulerOption) (transfer.FileScheduleReport, error) {
+			if len(jobs) != 1 {
+				t.Fatalf("expected one single-file job, got %#v", jobs)
+			}
+			captured = jobs[0]
+			if filepath.Base(captured.ResumeStatePath) != "payload.json" {
+				t.Fatalf("single-file resume metadata is not managed payload: %q", captured.ResumeStatePath)
+			}
+			if _, err := os.Stat(filepath.Join(filepath.Dir(captured.ResumeStatePath), "session.json")); err != nil {
+				t.Fatalf("single-file managed manifest missing during transfer: %v", err)
+			}
+			return transfer.FileScheduleReport{Results: []transfer.FileScheduleResult{{
+				JobID: captured.ID, DestinationPath: captured.DestinationPath, ExpectedSize: captured.ExpectedSize,
+				Result: transfer.FileDownloadResult{DestinationPath: captured.DestinationPath, BytesWritten: captured.ExpectedSize, NetworkPath: iface},
+			}}}, nil
+		},
+		downloadChunks: func(context.Context, transfer.ChunkDownloadRequest) (transfer.ChunkDownloadResult, error) {
+			t.Fatal("chunk downloader should not run")
+			return transfer.ChunkDownloadResult{}, nil
+		},
+	}
+	localTarget := filepath.Join(t.TempDir(), "a.bin")
+	summary, err := executeDownloadCommand(context.Background(), client, "/a.bin", localTarget, testDownloadCommandOptions(false), deps)
+	if err != nil {
+		t.Fatal(err)
+	}
+	inside, err := pathIsWithin(managedRoot, captured.ResumeStatePath)
+	if err != nil || !inside {
+		t.Fatalf("single-file metadata was not below managed root: %q inside=%v err=%v", captured.ResumeStatePath, inside, err)
+	}
+	if summary.SessionPath != "" || summary.SucceededCount != 1 {
+		t.Fatalf("single-file managed session was not cleaned after success: %#v", summary)
+	}
+	if _, err := os.Stat(filepath.Dir(captured.ResumeStatePath)); !os.IsNotExist(err) {
+		t.Fatalf("completed single-file session directory survived: %v", err)
+	}
+}
+
 func TestExecuteDownloadCommandChunkUsesLiveRangePathsAndChunkSettings(t *testing.T) {
+	managedRoot := filepath.Join(t.TempDir(), "sessions")
+	t.Setenv("115DRIVER_SESSION_DIR", managedRoot)
 	client := &fakeDownloadCommandClient{
 		dirIDs: map[string]string{"root": "d1"},
 		lists: map[string][]driver.File{
@@ -429,6 +519,10 @@ func TestExecuteDownloadCommandChunkUsesLiveRangePathsAndChunkSettings(t *testin
 	if captured.ResumeKey != "pa" || captured.MaxRefreshes != transfer.DefaultDownloadURLRefreshes || captured.Refresh == nil {
 		t.Fatalf("P9 chunk resume/refresh settings were not preserved: %#v", captured)
 	}
+	inside, err := pathIsWithin(managedRoot, captured.ResumeStatePath)
+	if err != nil || !inside || filepath.Base(filepath.Dir(captured.ResumeStatePath)) != "parts" || !strings.HasSuffix(filepath.Base(captured.ResumeStatePath), ".download.json") {
+		t.Fatalf("chunk resume metadata was not centralized below tree parts: path=%q inside=%v err=%v", captured.ResumeStatePath, inside, err)
+	}
 	client.downloads["pa"] = testDriverDownloadInfo("a.bin", 10, "https://cdn.example.invalid/a?token=refreshed")
 	fresh, refreshErr := captured.Refresh(context.Background())
 	if refreshErr != nil || fresh.URL != "https://cdn.example.invalid/a?token=refreshed" {
@@ -466,6 +560,26 @@ func TestValidateDownloadCommandOptionsAcceptsChunkAndRejectsUnknownStrategy(t *
 	}
 }
 
+func TestExecuteDownloadCommandPreservesResolverNetworkFailure(t *testing.T) {
+	networkErr := &net.DNSError{Err: "temporary resolver failure", Name: "webapi.115.com", IsTemporary: true}
+	client := &fakeDownloadCommandClient{dirErrs: map[string]error{"missing": networkErr}}
+
+	_, err := executeDownloadCommand(context.Background(), client, "/missing", filepath.Join(t.TempDir(), "out.bin"), testDownloadCommandOptions(false), defaultDownloadPipelineDeps())
+	if err == nil {
+		t.Fatal("expected resolver network failure")
+	}
+	var dnsErr *net.DNSError
+	if !errors.As(err, &dnsErr) {
+		t.Fatalf("download resolver error = %T %v, want net.DNSError", err, err)
+	}
+	if errors.Is(err, errDownloadRemoteNotFound) {
+		t.Fatalf("network failure was mislabeled as remote-not-found: %v", err)
+	}
+	if got := classifyRemoteError(err, output.ExitError); got != output.ExitNetwork {
+		t.Fatalf("download resolver network exit = %d, want ExitNetwork", got)
+	}
+}
+
 func testDownloadCommandOptions(recursive bool) downloadCommandOptions {
 	return downloadCommandOptions{
 		Recursive:           recursive,
@@ -497,13 +611,24 @@ func testCLIPath(name string, index int, ip string) transfer.NetworkPath {
 }
 
 type fakeDownloadCommandClient struct {
+	nilLists  map[string]bool
+	listCalls map[string]int
 	dirIDs    map[string]string
+	dirErrs   map[string]error
 	lists     map[string][]driver.File
 	files     map[string]driver.File
 	downloads map[string]*driver.DownloadInfo
+	dirCalls  map[string]int
 }
 
 func (client *fakeDownloadCommandClient) DirName2CID(dir string) (*driver.APIGetDirIDResp, error) {
+	if client.dirCalls == nil {
+		client.dirCalls = make(map[string]int)
+	}
+	client.dirCalls[dir]++
+	if err := client.dirErrs[dir]; err != nil {
+		return nil, err
+	}
 	id := "0"
 	if client.dirIDs != nil {
 		if configured, ok := client.dirIDs[dir]; ok {
@@ -514,6 +639,13 @@ func (client *fakeDownloadCommandClient) DirName2CID(dir string) (*driver.APIGet
 }
 
 func (client *fakeDownloadCommandClient) List(dirID string, _ ...driver.ListOption) (*[]driver.File, error) {
+	if client.listCalls == nil {
+		client.listCalls = make(map[string]int)
+	}
+	client.listCalls[dirID]++
+	if client.nilLists[dirID] {
+		return nil, nil
+	}
 	entries := append([]driver.File(nil), client.lists[dirID]...)
 	return &entries, nil
 }

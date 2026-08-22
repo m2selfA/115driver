@@ -45,6 +45,15 @@ func (p *Printer) PrintError(msg string, code int) int {
 	return code
 }
 
+func (p *Printer) PrintErrorData(msg string, code int, data interface{}) int {
+	if p.JSON {
+		p.printJSON(Envelope{Success: false, Data: data, Error: msg, Code: code})
+		return code
+	}
+	fmt.Fprintf(os.Stderr, "Error: %s\n", msg)
+	return code
+}
+
 func (p *Printer) printJSON(env Envelope) {
 	bytes, _ := json.MarshalIndent(env, "", "  ")
 	fmt.Println(string(bytes))

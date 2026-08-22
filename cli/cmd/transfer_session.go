@@ -4,6 +4,7 @@ import (
 	"crypto/sha1"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -12,6 +13,7 @@ import (
 	"strings"
 	"unicode"
 
+	"github.com/SheltonZhu/115driver/cli/internal/auth"
 	"github.com/SheltonZhu/115driver/internal/transfer"
 )
 
@@ -53,6 +55,187 @@ func deriveTransferSessionPaths(direction, localAnchor, remoteTarget, override s
 	return sessionPath, sessionPath + ".parts", nil
 }
 
+type transferSessionResolution struct {
+	SessionPath    string
+	PartsDir       string
+	ManagedDir     string
+	LegacyPath     string
+	LegacyParts    string
+	ImportedLegacy bool
+	Lock           *transfer.SessionLock
+}
+
+func resolveTransferSessionPaths(direction, kind, localAnchor, remoteTarget, strategy, transferMode, override string) (transferSessionResolution, error) {
+	if strings.TrimSpace(override) != "" {
+		sessionPath, partsDir, err := deriveTransferSessionPaths(direction, localAnchor, remoteTarget, override)
+		if err != nil {
+			return transferSessionResolution{}, err
+		}
+		lock, err := transfer.AcquireSessionLock(sessionPath+".lock", "")
+		if err != nil {
+			return transferSessionResolution{}, err
+		}
+		return transferSessionResolution{SessionPath: sessionPath, PartsDir: partsDir, Lock: lock}, nil
+	}
+	legacyPath, legacyParts, err := deriveTransferSessionPaths(direction, localAnchor, remoteTarget, "")
+	if err != nil {
+		return transferSessionResolution{}, err
+	}
+	config, err := auth.ResolveTransferConfig(configPath)
+	if err != nil {
+		return transferSessionResolution{}, err
+	}
+	profileName := auth.ResolveProfileName(configPath, profile)
+	profileScope, err := transfer.SessionProfileScope(auth.ResolveConfigFilePath(configPath), profileName)
+	if err != nil {
+		return transferSessionResolution{}, err
+	}
+	identity, err := transfer.NewSessionIdentityV2(direction, kind, profileScope, localAnchor, remoteTarget, strategy, transferMode)
+	if err != nil {
+		return transferSessionResolution{}, err
+	}
+	localAbs, err := filepath.Abs(localAnchor)
+	if err != nil {
+		return transferSessionResolution{}, err
+	}
+	accountID := int64(0)
+	if client != nil {
+		accountID = client.UserID
+	}
+	store := transfer.SessionStore{Root: config.SessionDir}
+	location, err := store.Location(identity, filepath.Base(localAbs))
+	if err != nil {
+		return transferSessionResolution{}, err
+	}
+	lock, err := transfer.AcquireSessionLock(location.LockPath, location.LeasePath)
+	if err != nil {
+		return transferSessionResolution{}, err
+	}
+	location, _, err = store.Open(identity, filepath.Base(localAbs), accountID)
+	if errors.Is(err, transfer.ErrSessionCompleted) {
+		if leaseErr := lock.StopLease(); leaseErr != nil {
+			_ = lock.Close()
+			return transferSessionResolution{}, leaseErr
+		}
+		if _, cleanupErr := transfer.RemoveManagedSessionForPayload(location.PayloadPath); cleanupErr != nil {
+			_ = lock.Close()
+			return transferSessionResolution{}, cleanupErr
+		}
+		location, _, err = store.Open(identity, filepath.Base(localAbs), accountID)
+	}
+	if errors.Is(err, transfer.ErrSessionStore) {
+		if leaseErr := lock.StopLease(); leaseErr != nil {
+			_ = lock.Close()
+			return transferSessionResolution{}, leaseErr
+		}
+		if _, quarantineErr := store.QuarantineCorruptLocation(location); quarantineErr != nil {
+			_ = lock.Close()
+			return transferSessionResolution{}, quarantineErr
+		}
+		location, _, err = store.Open(identity, filepath.Base(localAbs), accountID)
+	}
+	if err != nil {
+		_ = lock.Close()
+		return transferSessionResolution{}, err
+	}
+	if config.SessionAutoGC {
+		if _, gcErr := store.RunOpportunisticGC(config.SessionGCInterval, transfer.SessionGCOptions{
+			Retention: config.SessionRetention, TrashRetention: config.SessionTrashRetention,
+		}); gcErr != nil {
+			fmt.Fprintf(os.Stderr, "Warning: session GC failed: %v\n", gcErr)
+		}
+	}
+	return transferSessionResolution{
+		SessionPath: location.PayloadPath, PartsDir: location.PartsDir, ManagedDir: location.Dir,
+		LegacyPath: legacyPath, LegacyParts: legacyParts, Lock: lock,
+	}, nil
+}
+
+func legacyTransferSessionImportNeeded(resolution transferSessionResolution) (bool, error) {
+	if resolution.ManagedDir == "" || strings.TrimSpace(resolution.LegacyPath) == "" {
+		return false, nil
+	}
+	if _, err := os.Lstat(resolution.SessionPath); err == nil {
+		return false, nil
+	} else if !os.IsNotExist(err) {
+		return false, err
+	}
+	info, err := os.Lstat(resolution.LegacyPath)
+	if os.IsNotExist(err) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return info.Mode().IsRegular() && info.Mode()&os.ModeSymlink == 0, nil
+}
+
+func importLegacyTransferSession(resolution *transferSessionResolution, validate func(string) (bool, error)) error {
+	if resolution == nil || resolution.ManagedDir == "" || strings.TrimSpace(resolution.LegacyPath) == "" || validate == nil {
+		return nil
+	}
+	if _, err := os.Lstat(resolution.SessionPath); err == nil {
+		return nil
+	} else if !os.IsNotExist(err) {
+		return err
+	}
+	valid, err := validate(resolution.LegacyPath)
+	if err != nil {
+		return err
+	}
+	if !valid {
+		return nil
+	}
+	imported, err := transfer.ImportLegacySession(transfer.SessionLocation{
+		Dir: resolution.ManagedDir, PayloadPath: resolution.SessionPath, PartsDir: resolution.PartsDir,
+	}, resolution.LegacyPath, resolution.LegacyParts)
+	if err != nil || !imported {
+		return err
+	}
+	copiedValid, verifyErr := validate(resolution.SessionPath)
+	if verifyErr != nil || !copiedValid {
+		removePayloadErr := os.Remove(resolution.SessionPath)
+		if os.IsNotExist(removePayloadErr) {
+			removePayloadErr = nil
+		}
+		removePartsErr := os.RemoveAll(resolution.PartsDir)
+		if verifyErr == nil {
+			verifyErr = fmt.Errorf("imported legacy session failed destination validation")
+		}
+		return errors.Join(verifyErr, removePayloadErr, removePartsErr)
+	}
+	resolution.ImportedLegacy = true
+	return nil
+}
+
+func (resolution *transferSessionResolution) closeLock() error {
+	if resolution == nil || resolution.Lock == nil {
+		return nil
+	}
+	err := resolution.Lock.Close()
+	resolution.Lock = nil
+	return err
+}
+
+func commitLegacyTransferSessionImport(resolution transferSessionResolution) {
+	if resolution.ImportedLegacy {
+		transfer.RemoveLegacySessionBestEffort(resolution.LegacyPath, resolution.LegacyParts)
+	}
+}
+
+func cleanupResolvedTransferSession(resolution transferSessionResolution) error {
+	if resolution.ManagedDir == "" {
+		return nil
+	}
+	if resolution.Lock != nil {
+		if err := resolution.Lock.StopLease(); err != nil {
+			return err
+		}
+	}
+	_, err := transfer.RemoveManagedSessionForPayload(resolution.SessionPath)
+	return err
+}
+
 func canonicalTransferSessionLocalPath(path string) string {
 	cleaned := filepath.Clean(path)
 	if runtime.GOOS == "windows" {
@@ -64,6 +247,11 @@ func canonicalTransferSessionLocalPath(path string) string {
 func uploadResumePathForRelative(partsDir, relative string) string {
 	digest := sha256.Sum256([]byte(filepath.Clean(relative)))
 	return filepath.Join(partsDir, hex.EncodeToString(digest[:12])+".upload.json")
+}
+
+func downloadResumePathForRelative(partsDir, relative string) string {
+	digest := sha256.Sum256([]byte(filepath.Clean(relative)))
+	return filepath.Join(partsDir, hex.EncodeToString(digest[:12])+".download.json")
 }
 
 func safeTransferSessionBase(value string) string {

@@ -37,8 +37,8 @@ func loginWithCookie() error {
 	}
 
 	c := driver.New(driver.UA(driver.UA115Browser)).ImportCredential(cr)
-	if err := c.LoginCheck(); err != nil {
-		return &exitError{code: output.ExitAuth, msg: fmt.Sprintf("Cookie validation failed: %v", err)}
+	if err := c.CookieCheck(); err != nil {
+		return &exitError{code: classifyNetworkError(err, output.ExitAuth), msg: fmt.Sprintf("Cookie validation failed: %v", err)}
 	}
 
 	if err := auth.SaveCredential(configPath, profile, loginCookie); err != nil {
@@ -60,7 +60,7 @@ func loginWithQRCode() error {
 	c := driver.New(driver.UA(driver.UA115Browser))
 	session, err := c.QRCodeStart()
 	if err != nil {
-		return &exitError{code: output.ExitError, msg: fmt.Sprintf("Failed to start QR login: %v", err)}
+		return &exitError{code: classifyNetworkError(err, output.ExitError), msg: fmt.Sprintf("Failed to start QR login: %v", err)}
 	}
 
 	qrURL := fmt.Sprintf("https://qrcodeapi.115.com/api/1.0/mac/1.0/qrcode?uid=%s", session.UID)
@@ -92,7 +92,7 @@ func loginWithQRCode() error {
 		if status.IsAllowed() {
 			cred, err := c.QRCodeLogin(session)
 			if err != nil {
-				return &exitError{code: output.ExitAuth, msg: fmt.Sprintf("Login failed: %v", err)}
+				return &exitError{code: classifyNetworkError(err, output.ExitAuth), msg: fmt.Sprintf("Login failed: %v", err)}
 			}
 
 			cookieStr := cred.Cookie()
