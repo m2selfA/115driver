@@ -22,6 +22,8 @@ coverage/
 /115driver
 /115driver-mcp-server
 /mcp/115driver-mcp-server
+/mcp-server
+/mcp/mcp-server
 
 # Local cross-build / phase validation scratch artifacts
 /.p[0-9]-*

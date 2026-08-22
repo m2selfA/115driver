@@ -1,0 +1,40 @@
+{
+  "schema": "115driver.rc-commit-manifest/v1",
+  "base_tag": "v0.1.4",
+  "candidate_tag": "v0.2.0-rc.1",
+  "classifier": "r17-v1",
+  "total_paths": 402,
+  "path_set_sha256": "3d152170cad105d2e95bcb30a80c2d759dbd48c1c0ca4b3e4a6a998c0c5e3095",
+  "layers": [
+    {
+      "id": "driver",
+      "subject": "feat(driver): harden API validation and read-only controls",
+      "count": 46,
+      "path_set_sha256": "f6dd744711d510b4934b32a2902cb34ccf934a3ffac90ca0247e41128a62ca43"
+    },
+    {
+      "id": "core",
+      "subject": "feat(core): add durable transfer and sync recovery engines",
+      "count": 96,
+      "path_set_sha256": "0bfa8bc9ee015dde5a6c59380a366549fe6c5f0d2537909dba1e0eb273a9ed0c"
+    },
+    {
+      "id": "cli",
+      "subject": "feat(cli): add batch transfer sync and maintenance workflows",
+      "count": 103,
+      "path_set_sha256": "b27501b536b078f44aab94b1ecfe1dccbd283e2f2182239710d5cafdec2a1a95"
+    },
+    {
+      "id": "mcp",
+      "subject": "feat(mcp): add typed batch planning and recovery tools",
+      "count": 125,
+      "path_set_sha256": "d428b77b3f42e417b0549e1a9dd8fd1fb5174c5c5d1a33f3d7fea834b9daa662"
+    },
+    {
+      "id": "release",
+      "subject": "feat(release): certify reproducible rerun-safe RC promotion",
+      "count": 32,
+      "path_set_sha256": "914d4f7858a7ada999457e49af9b182e676b1f2370983c2e9019a602ae263bcc"
+    }
+  ]
+}

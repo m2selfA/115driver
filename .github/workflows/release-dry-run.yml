@@ -1,0 +1,135 @@
+name: release-dry-run
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Proposed SemVer release tag, for example v0.2.0-rc.1
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-dry-run-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  dry-run:
+    name: non-publishing release candidate dry-run
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up pinned release Go
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version: "1.23.4"
+          cache: true
+
+      - name: Download modules
+        run: go mod download
+
+      - name: Inspect actual tag and GitHub release state
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+        run: |
+          set -euo pipefail
+          tag_sha="$GITHUB_SHA"
+          if git rev-parse -q --verify "refs/tags/${RELEASE_TAG}^{commit}" >/dev/null; then
+            tag_sha="$(git rev-list -n 1 "$RELEASE_TAG")"
+          fi
+          gh api --paginate --slurp "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
+            | jq '[.[][]]' > "$RUNNER_TEMP/release-api.json"
+          go run ./cmd/release-preflight \
+            -tag "$RELEASE_TAG" \
+            -expected-sha "$GITHUB_SHA" \
+            -tag-sha "$tag_sha" \
+            -releases-file "$RUNNER_TEMP/release-api.json" \
+            > "$RUNNER_TEMP/release-preflight-actual.json"
+          cat "$RUNNER_TEMP/release-preflight-actual.json"
+
+      - name: Simulate absent draft and published recovery states
+        env:
+          RELEASE_TAG: ${{ inputs.release_tag }}
+        run: |
+          set -euo pipefail
+          for state in absent draft published; do
+            go run ./cmd/release-preflight \
+              -tag "$RELEASE_TAG" \
+              -expected-sha "$GITHUB_SHA" \
+              -simulate-state "$state" \
+              -releases-file "$RUNNER_TEMP/release-api.json" \
+              > "$RUNNER_TEMP/release-preflight-${state}.json"
+            cat "$RUNNER_TEMP/release-preflight-${state}.json"
+          done
+
+      - name: Run complete release readiness gate
+        env:
+          CGO_ENABLED: "1"
+          COOKIE: "UID=1;CID=2;SEID=3;KID=4"
+          RUN_115_INTEGRATION: "0"
+          RUN_115_DESTRUCTIVE_INTEGRATION: "0"
+        run: make release-ready-race
+
+      - name: Download pinned Syft
+        id: syft
+        uses: anchore/sbom-action/download-syft@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
+        with:
+          syft-version: v1.50.0
+
+      - name: Add pinned Syft to PATH
+        run: |
+          syft_cmd="${{ steps.syft.outputs.cmd }}"
+          test -n "$syft_cmd"
+          echo "$(dirname "$syft_cmd")" >> "$GITHUB_PATH"
+
+      - name: Verify pinned Syft
+        run: syft version
+
+      - name: Create local-only proposed release tag
+        env:
+          RELEASE_TAG: ${{ inputs.release_tag }}
+        run: |
+          set -euo pipefail
+          if git show-ref --verify --quiet "refs/tags/$RELEASE_TAG"; then
+            test "$(git rev-list -n 1 "$RELEASE_TAG")" = "$GITHUB_SHA"
+          else
+            git tag "$RELEASE_TAG" "$GITHUB_SHA"
+          fi
+          git tag --points-at "$GITHUB_SHA" | grep -Fx "$RELEASE_TAG" >/dev/null
+
+      - name: Build non-publishing final-version candidate
+        uses: goreleaser/goreleaser-action@e435ccd777264be153ace6237001ef4d979d3a7a # v6
+        with:
+          distribution: goreleaser
+          version: "v2.17.1"
+          args: release --clean --skip=publish --parallelism=1
+
+      - name: Verify candidate archive SBOM and install surfaces
+        env:
+          RELEASE_TAG: ${{ inputs.release_tag }}
+        run: make verify-release-artifacts EXPECTED_ARTIFACT_VERSION="${RELEASE_TAG#v}"
+
+      - name: Generate and inspect release notes
+        env:
+          RELEASE_TAG: ${{ inputs.release_tag }}
+        run: |
+          set -euo pipefail
+          go run ./cmd/release-notes -tag "$RELEASE_TAG" > "$RUNNER_TEMP/release-notes.md"
+          test -s "$RUNNER_TEMP/release-notes.md"
+          cat "$RUNNER_TEMP/release-notes.md"
+
+      - name: Assert dry-run authority remains read-only
+        run: |
+          set -euo pipefail
+          test -f dist/checksums.txt
+          test "$(find dist -maxdepth 1 -type f -name '115driver_*.tar.gz' | wc -l)" -eq 6
+          test "$(find dist -maxdepth 1 -type f -name '115driver_*.tar.gz.spdx.json' | wc -l)" -eq 6
+          test "$(wc -l < dist/checksums.txt)" -eq 12

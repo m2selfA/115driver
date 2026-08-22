@@ -4,6 +4,7 @@ builds:
   - id: 115driver
     main: ./cmd/115driver
     binary: 115driver
+    mod_timestamp: "{{ .CommitTimestamp }}"
     flags:
       - -trimpath
     ldflags:
@@ -18,8 +19,36 @@ builds:
       - amd64
       - arm64
 
+  - id: 115driver-mcp-server
+    main: ./cmd/115driver-mcp-server
+    binary: 115driver-mcp-server
+    mod_timestamp: "{{ .CommitTimestamp }}"
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w -X github.com/SheltonZhu/115driver/mcp/server.version={{.Version}}
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+      - darwin
+      - windows
+    goarch:
+      - amd64
+      - arm64
+
 archives:
-  - name_template: >-
+  - ids:
+      - 115driver
+      - 115driver-mcp-server
+    formats:
+      - tar.gz
+    wrap_in_directory: false
+    builds_info:
+      owner: root
+      group: root
+      mtime: "{{ .CommitDate }}"
+    name_template: >-
       {{ .ProjectName }}_
       {{- .Version }}_
       {{- .Os }}_
@@ -27,11 +56,34 @@ archives:
       {{- else if eq .Arch "arm64" }}aarch64
       {{- else }}{{ .Arch }}{{ end }}
     files:
-      - LICENSE
-      - README.md
+      - src: LICENSE
+        info:
+          owner: root
+          group: root
+          mode: 0644
+          mtime: "{{ .CommitDate }}"
+      - src: README.md
+        info:
+          owner: root
+          group: root
+          mode: 0644
+          mtime: "{{ .CommitDate }}"
+
+sboms:
+  - id: archive-spdx
+    artifacts: archive
+    documents:
+      - "{{ .ArtifactName }}.spdx.json"
+    cmd: syft
+    args:
+      - "${artifact}"
+      - --output
+      - "spdx-json=${document}"
+    disable: false
 
 checksum:
   name_template: checksums.txt
+  algorithm: sha256
 
 changelog:
   sort: asc

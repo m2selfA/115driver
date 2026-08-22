@@ -11,7 +11,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ### Build
 ```bash
 # Build the main MCP server binary
-go build -o mcp/115driver-mcp-server ./mcp/main.go
+go build -o 115driver-mcp-server ./cmd/115driver-mcp-server
 
 # Install dependencies
 go mod tidy
@@ -32,10 +32,13 @@ go test -v ./pkg/driver/
 go test -v ./pkg/driver/ -run TestFunctionName
 ```
 
+The default Go test suite must remain offline-safe. Live 115 integration requires both `RUN_115_INTEGRATION=1` and `COOKIE`. Prefer `make test-integration-readonly COOKIE='...'`, which runs only `TestReadOnlyIntegrationSmoke`. Tests that can mutate cloud state additionally require `RUN_115_DESTRUCTIVE_INTEGRATION=1`; do not enable that variable for ordinary validation, CI, or read-only smoke testing.
+Use `CookieCheck` for ordinary credential validation. `LoginCheck` may log out other devices and must be treated as a destructive operation; do not call it from read-only flows, ordinary CI, or credential-validation paths.
+
 ### Running the MCP Server
 ```bash
 # The MCP server requires cookie authentication
-./mcp/115driver-mcp-server --cookie="UID=xxx;CID=xxx;SEID=xxx;KID=xxx"
+./115driver-mcp-server --cookie="UID=xxx;CID=xxx;SEID=xxx;KID=xxx"
 
 # The server communicates via stdin/stdout using JSON-RPC 2.0
 ```
@@ -60,18 +63,20 @@ go test -v ./pkg/driver/ -run TestFunctionName
 - ECDH key exchange, AES encryption
 - Required for secure communication with 115 services
 
-**`mcp/`** - Model Context Protocol server
-- `main.go` - Entry point with cookie flag authentication
-- `server/server.go` - MCP server core with tool registration
-- `server/tools/` - Individual MCP tool implementations (one file per tool category)
+**MCP command/server layout**
+- `cmd/115driver-mcp-server/main.go` - Canonical go-install/release entry point
+- `internal/mcpapp/` - Shared MCP command startup, config, and argument handling
+- `mcp/main.go` - Backward-compatible legacy source entry point only
+- `mcp/server/server.go` - MCP server core with tool registration
+- `mcp/server/tools/` - Individual MCP tool implementations (one file per tool category)
 
 ### Authentication
 
-The driver uses cookie-based authentication with four required components:
+The driver uses cookie-based authentication. `UID`, `CID`, and `SEID` are required; `KID` is optional for legacy-compatible cookies and should be preserved when present:
 - `UID` - User ID
 - `CID` - Credential ID
 - `SEID` - Session ID
-- `KID` - Key ID
+- `KID` - Optional key ID
 
 These can be imported from a cookie string using `FromCookie()` or set directly via the `Credential` struct.
 

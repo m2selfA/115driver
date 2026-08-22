@@ -1,0 +1,41 @@
+name: integration-readonly
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: integration-readonly
+  cancel-in-progress: false
+
+jobs:
+  smoke:
+    name: read-only 115 API smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Download modules
+        run: go mod download
+
+      - name: Run read-only integration smoke
+        env:
+          COOKIE: ${{ secrets.DRIVER115_INTEGRATION_COOKIE }}
+          RUN_115_INTEGRATION: "1"
+          RUN_115_DESTRUCTIVE_INTEGRATION: "0"
+        run: |
+          if [ -z "$COOKIE" ]; then
+            echo "Missing DRIVER115_INTEGRATION_COOKIE repository secret" >&2
+            exit 1
+          fi
+          go test -count=1 -run '^TestReadOnlyIntegrationSmoke$' ./pkg/driver
