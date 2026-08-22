@@ -54,6 +54,11 @@ jobs:
             -releases-file "$RUNNER_TEMP/release-api.json" \
             > "$RUNNER_TEMP/release-preflight-actual.json"
           cat "$RUNNER_TEMP/release-preflight-actual.json"
+          echo "GORELEASER_CURRENT_TAG=$RELEASE_TAG" >> "$GITHUB_ENV"
+          latest_published_tag="$(jq -r '.latest_published_tag // empty' "$RUNNER_TEMP/release-preflight-actual.json")"
+          if [ -n "$latest_published_tag" ]; then
+            echo "GORELEASER_PREVIOUS_TAG=$latest_published_tag" >> "$GITHUB_ENV"
+          fi
 
       - name: Verify stable promotion source commit
         run: |

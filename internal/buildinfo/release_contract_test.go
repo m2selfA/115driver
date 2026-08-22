@@ -353,6 +353,9 @@ func TestStablePromotionRequiresExactPrereleaseCommit(t *testing.T) {
 			"promotion_sha=\"$(git rev-list -n 1 \"$promotion_from\")\"",
 			"stable promotion must reuse the exact latest prerelease commit",
 			"publish another prerelease first",
+			"GORELEASER_CURRENT_TAG=",
+			"GORELEASER_PREVIOUS_TAG=$latest_published_tag",
+			".latest_published_tag // empty",
 		} {
 			if !strings.Contains(workflow, needle) {
 				t.Errorf("%s does not pin stable promotion commit identity %q", filepath.ToSlash(rel), needle)

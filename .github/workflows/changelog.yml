@@ -100,6 +100,11 @@ jobs:
             > "$RUNNER_TEMP/release-preflight.json"
           test "$(jq -r '.state' "$RUNNER_TEMP/release-preflight.json")" = "${{ steps.release_state.outputs.state }}"
           cat "$RUNNER_TEMP/release-preflight.json"
+          echo "GORELEASER_CURRENT_TAG=$GITHUB_REF_NAME" >> "$GITHUB_ENV"
+          latest_published_tag="$(jq -r '.latest_published_tag // empty' "$RUNNER_TEMP/release-preflight.json")"
+          if [ -n "$latest_published_tag" ]; then
+            echo "GORELEASER_PREVIOUS_TAG=$latest_published_tag" >> "$GITHUB_ENV"
+          fi
 
       - name: Verify stable promotion source commit
         if: steps.release_state.outputs.state != 'published'
