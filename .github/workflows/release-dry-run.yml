@@ -55,6 +55,19 @@ jobs:
             > "$RUNNER_TEMP/release-preflight-actual.json"
           cat "$RUNNER_TEMP/release-preflight-actual.json"
 
+      - name: Verify stable promotion source commit
+        run: |
+          set -euo pipefail
+          promotion_from="$(jq -r '.promotion_from // empty' "$RUNNER_TEMP/release-preflight-actual.json")"
+          if [ -z "$promotion_from" ]; then
+            exit 0
+          fi
+          promotion_sha="$(git rev-list -n 1 "$promotion_from")"
+          if [ "$promotion_sha" != "$GITHUB_SHA" ]; then
+            echo "stable promotion must reuse the exact latest prerelease commit: $promotion_from=$promotion_sha candidate=$GITHUB_SHA; publish another prerelease first" >&2
+            exit 1
+          fi
+
       - name: Simulate absent draft and published recovery states
         env:
           RELEASE_TAG: ${{ inputs.release_tag }}

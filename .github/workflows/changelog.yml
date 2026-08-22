@@ -101,6 +101,20 @@ jobs:
           test "$(jq -r '.state' "$RUNNER_TEMP/release-preflight.json")" = "${{ steps.release_state.outputs.state }}"
           cat "$RUNNER_TEMP/release-preflight.json"
 
+      - name: Verify stable promotion source commit
+        if: steps.release_state.outputs.state != 'published'
+        run: |
+          set -euo pipefail
+          promotion_from="$(jq -r '.promotion_from // empty' "$RUNNER_TEMP/release-preflight.json")"
+          if [ -z "$promotion_from" ]; then
+            exit 0
+          fi
+          promotion_sha="$(git rev-list -n 1 "$promotion_from")"
+          if [ "$promotion_sha" != "$GITHUB_SHA" ]; then
+            echo "stable promotion must reuse the exact latest prerelease commit: $promotion_from=$promotion_sha candidate=$GITHUB_SHA; publish another prerelease first" >&2
+            exit 1
+          fi
+
       - name: Verify existing published release
         if: steps.release_state.outputs.state == 'published'
         env:

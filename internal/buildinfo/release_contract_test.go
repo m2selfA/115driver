@@ -340,6 +340,34 @@ func TestReleasePackagingContractPinsR17CommitBoundary(t *testing.T) {
 	}
 }
 
+func TestStablePromotionRequiresExactPrereleaseCommit(t *testing.T) {
+	root := releaseContractRepoRoot(t)
+	for _, rel := range []string{
+		filepath.Join(".github", "workflows", "release-dry-run.yml"),
+		filepath.Join(".github", "workflows", "changelog.yml"),
+	} {
+		workflow := readReleaseContractFile(t, root, rel)
+		for _, needle := range []string{
+			"Verify stable promotion source commit",
+			".promotion_from // empty",
+			"promotion_sha=\"$(git rev-list -n 1 \"$promotion_from\")\"",
+			"stable promotion must reuse the exact latest prerelease commit",
+			"publish another prerelease first",
+		} {
+			if !strings.Contains(workflow, needle) {
+				t.Errorf("%s does not pin stable promotion commit identity %q", filepath.ToSlash(rel), needle)
+			}
+		}
+	}
+
+	release := readReleaseContractFile(t, root, filepath.Join(".github", "workflows", "changelog.yml"))
+	stableIndex := strings.Index(release, "Verify stable promotion source commit")
+	gateIndex := strings.Index(release, "Run complete release readiness gate")
+	if stableIndex < 0 || gateIndex < stableIndex {
+		t.Fatal("tag release must verify stable promotion source commit before the full release readiness gate")
+	}
+}
+
 func TestGitHubActionsDependencyUpdateContract(t *testing.T) {
 	root := releaseContractRepoRoot(t)
 	dependabot := readReleaseContractFile(t, root, filepath.Join(".github", "dependabot.yml"))
