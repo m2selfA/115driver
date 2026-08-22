@@ -32,6 +32,50 @@ func TestValidateUploadURLRejectsUnsafeTargets(t *testing.T) {
 	}
 }
 
+func TestValidateUploadURLMalformedErrorDoesNotEchoSource(t *testing.T) {
+	const rawURL = "https://user:password@example.com/%zz?token=super-secret#fragment"
+	_, err := validateUploadURL(rawURL)
+	if err == nil {
+		t.Fatal("malformed URL was accepted")
+	}
+	for _, secret := range []string{"user", "password", "%zz", "token", "super-secret", "fragment"} {
+		if strings.Contains(err.Error(), secret) {
+			t.Fatalf("malformed URL error leaked %q: %v", secret, err)
+		}
+	}
+	if err.Error() != "malformed URL" {
+		t.Fatalf("malformed URL error = %q", err.Error())
+	}
+}
+
+func TestSanitizeMCPExternalURLErrorRedactsURLSecretsRecursively(t *testing.T) {
+	inner := &url.Error{
+		Op:  "dial",
+		URL: "https://inner-user:inner-pass@inner.example/private?inner_token=secret#inner-fragment",
+		Err: errors.New("network down"),
+	}
+	outer := &url.Error{
+		Op:  "Get",
+		URL: "https://outer-user:outer-pass@outer.example/private/file?download_token=secret#fragment",
+		Err: inner,
+	}
+	safe := sanitizeMCPExternalURLError(outer)
+	if safe == nil {
+		t.Fatal("sanitized URL error is nil")
+	}
+	text := safe.Error()
+	for _, secret := range []string{"outer-user", "outer-pass", "/private", "download_token", "inner-user", "inner-pass", "inner_token", "fragment"} {
+		if strings.Contains(text, secret) {
+			t.Fatalf("sanitized URL error leaked %q: %s", secret, text)
+		}
+	}
+	for _, diagnostic := range []string{"outer.example", "inner.example", "network down"} {
+		if !strings.Contains(text, diagnostic) {
+			t.Fatalf("sanitized URL error lost %q: %s", diagnostic, text)
+		}
+	}
+}
+
 func TestValidateUploadURLAcceptsHTTPSURL(t *testing.T) {
 	got, err := validateUploadURL("https://example.com/path/file.bin?token=abc")
 	if err != nil {
@@ -39,6 +83,40 @@ func TestValidateUploadURLAcceptsHTTPSURL(t *testing.T) {
 	}
 	if got.String() != "https://example.com/path/file.bin?token=abc" {
 		t.Fatalf("unexpected parsed URL: %s", got.String())
+	}
+}
+
+func TestNormalizeLocalRootValidatesAndCanonicalizesConfiguredBoundary(t *testing.T) {
+	if got, err := NormalizeLocalRoot("   "); err != nil || got != "" {
+		t.Fatalf("empty local root = %q, %v; want disabled", got, err)
+	}
+
+	root := t.TempDir()
+	got, err := NormalizeLocalRoot(root)
+	if err != nil {
+		t.Fatalf("normalize local root: %v", err)
+	}
+	want, err := filepath.EvalSymlinks(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want, err = filepath.Abs(want)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != filepath.Clean(want) {
+		t.Fatalf("normalized local root = %q, want %q", got, filepath.Clean(want))
+	}
+
+	if _, err := NormalizeLocalRoot(filepath.Join(root, "missing")); err == nil {
+		t.Fatal("missing local root was accepted")
+	}
+	file := filepath.Join(root, "file.txt")
+	if err := os.WriteFile(file, []byte("data"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := NormalizeLocalRoot(file); err == nil {
+		t.Fatal("regular file was accepted as local root")
 	}
 }
 

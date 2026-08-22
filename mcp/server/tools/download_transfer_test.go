@@ -3,15 +3,19 @@ package tools
 import (
 	"context"
 	"errors"
+	"io"
 	"net"
 	"net/http"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/SheltonZhu/115driver/internal/transfer"
 	"github.com/SheltonZhu/115driver/pkg/driver"
+	"github.com/go-resty/resty/v2"
+	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
 func TestDefaultDownloadTransferConfig(t *testing.T) {
@@ -274,6 +278,40 @@ func TestDownloadThroughTransferChunkUsesRangePathsAndChunkSettings(t *testing.T
 	}
 }
 
+func TestDownloadThroughTransferZeroByteFileDoesNotTurnEmptyProbeIntoNoEligiblePaths(t *testing.T) {
+	worker := mcpTestNetworkPath("Ethernet 1", 1, "10.0.0.1")
+	ft := NewFileTools(nil)
+	ft.downloadTransfer.deps = mcpDownloadTransferDeps{
+		discoverNetworkPaths: func(context.Context) (transfer.NetworkDiscoveryResult, error) {
+			return transfer.NetworkDiscoveryResult{Paths: []transfer.NetworkPath{worker}, Probes: []transfer.NetworkPathProbe{{Path: worker, Reachable: true}}}, nil
+		},
+		listNetworkPaths: func() ([]transfer.NetworkPath, error) { return nil, errors.New("unexpected manual listing") },
+		probeCDNPaths: func(context.Context, string, http.Header, []transfer.NetworkPath, *transfer.CDNProbeCache, ...transfer.CDNProbeOption) (transfer.CDNDiscoveryResult, error) {
+			return transfer.CDNDiscoveryResult{Host: "cdn.example.invalid", Paths: []transfer.NetworkPath{}}, nil
+		},
+		scheduleFiles: func(_ context.Context, workers []transfer.NetworkPath, jobs []transfer.FileTransferJob, _ ...transfer.FileSchedulerOption) (transfer.FileScheduleReport, error) {
+			if len(workers) != 1 || len(jobs) != 1 {
+				t.Fatalf("unexpected zero-byte schedule shape: workers=%#v jobs=%#v", workers, jobs)
+			}
+			if jobs[0].NetworkPaths != nil {
+				t.Fatalf("zero-byte job kept non-nil empty path restriction: %#v", jobs[0].NetworkPaths)
+			}
+			return transfer.FileScheduleReport{Results: []transfer.FileScheduleResult{{JobID: jobs[0].ID, Result: transfer.FileDownloadResult{DestinationPath: jobs[0].DestinationPath}}}}, nil
+		},
+		downloadChunks: func(context.Context, transfer.ChunkDownloadRequest) (transfer.ChunkDownloadResult, error) {
+			t.Fatal("chunk downloader should not run in file strategy")
+			return transfer.ChunkDownloadResult{}, nil
+		},
+	}
+	result, err := ft.downloadThroughTransfer(context.Background(), &driver.DownloadInfo{
+		FileSize: 0,
+		Url:      driver.FileDownloadUrl{Url: "https://cdn.example.invalid/empty"},
+	}, filepath.Join("root", "empty.bin"), "empty-pick")
+	if err != nil || result.BytesWritten != 0 {
+		t.Fatalf("zero-byte single download = %#v, %v", result, err)
+	}
+}
+
 func TestDownloadThroughTransferRejectsKnownOversizeBeforeNetworkProbe(t *testing.T) {
 	ft := NewFileTools(nil, WithDownloadMaxBytes(10))
 	discovered := false
@@ -318,10 +356,38 @@ func TestResolveMCPDownloadPathSelectionManualSelectors(t *testing.T) {
 	}
 }
 
+func TestDownloadTargetsRejectExistingDirectoryBeforeUsingClient(t *testing.T) {
+	root := t.TempDir()
+	ft := NewFileTools(nil, WithLocalRoot(root))
+	result, _, err := ft.downloadFile(context.Background(), nil, DownloadSingleFileArgs{PickCode: "pick", LocalPath: root})
+	if err != nil {
+		t.Fatalf("download_file handler returned Go error: %v", err)
+	}
+	if result == nil || !result.IsError || len(result.Content) != 1 {
+		t.Fatalf("download_file directory target did not fail closed: %#v", result)
+	}
+	text, ok := result.Content[0].(*mcp.TextContent)
+	if !ok || !strings.Contains(text.Text, "regular file") || strings.Contains(text.Text, "client is unavailable") {
+		t.Fatalf("download_file directory target reached client or lost diagnostic: %#v", result.Content[0])
+	}
+
+	result, _, err = ft.downloadShareFile(context.Background(), nil, DownloadShareFileArgs{ShareCode: "share", FileID: "file", LocalPath: root})
+	if err != nil {
+		t.Fatalf("download_share_file handler returned Go error: %v", err)
+	}
+	if result == nil || !result.IsError || len(result.Content) != 1 {
+		t.Fatalf("download_share_file directory target did not fail closed: %#v", result)
+	}
+	text, ok = result.Content[0].(*mcp.TextContent)
+	if !ok || !strings.Contains(text.Text, "regular file") || strings.Contains(text.Text, "client is unavailable") {
+		t.Fatalf("download_share_file directory target reached client or lost diagnostic: %#v", result.Content[0])
+	}
+}
+
 func TestDownloadFileRejectsOutsideLocalRootBeforeUsingClient(t *testing.T) {
 	root := t.TempDir()
 	ft := NewFileTools(nil, WithLocalRoot(root))
-	result, _, err := ft.downloadFile(context.Background(), nil, DownloadFileArgs{
+	result, _, err := ft.downloadFile(context.Background(), nil, DownloadSingleFileArgs{
 		PickCode:  "pick",
 		LocalPath: filepath.Join(filepath.Dir(root), "outside.bin"),
 	})
@@ -331,6 +397,155 @@ func TestDownloadFileRejectsOutsideLocalRootBeforeUsingClient(t *testing.T) {
 	if result == nil || !result.IsError {
 		t.Fatalf("expected local-root rejection, got %#v", result)
 	}
+}
+
+func TestDownloadShareFileRejectsOutsideLocalRootBeforeUsingClient(t *testing.T) {
+	root := t.TempDir()
+	ft := NewFileTools(nil, WithLocalRoot(root))
+	result, _, err := ft.downloadShareFile(context.Background(), nil, DownloadShareFileArgs{
+		ShareCode: "share-code", ReceiveCode: "receive-code", FileID: "f1",
+		LocalPath: filepath.Join(filepath.Dir(root), "outside.bin"),
+	})
+	if err != nil {
+		t.Fatalf("MCP handler should return tool error, got Go error: %v", err)
+	}
+	if result == nil || !result.IsError {
+		t.Fatalf("expected local-root rejection, got %#v", result)
+	}
+}
+
+func TestDownloadShareFileRedactsReceiveCodeFromAPIErrors(t *testing.T) {
+	const receiveCode = "top-secret-receive-code"
+	client := driver.New(driver.WithRestyClient(resty.NewWithClient(&http.Client{Transport: mcpTestRoundTripFunc(func(*http.Request) (*http.Response, error) {
+		return nil, errors.New("upstream rejected receive code " + receiveCode)
+	})})))
+	root := t.TempDir()
+	ft := NewFileTools(client, WithLocalRoot(root))
+	result, _, err := ft.downloadShareFile(context.Background(), nil, DownloadShareFileArgs{
+		ShareCode: "share-code", ReceiveCode: receiveCode, FileID: "f1", LocalPath: filepath.Join(root, "file.bin"),
+	})
+	if err != nil {
+		t.Fatalf("MCP handler should return tool error, got Go error: %v", err)
+	}
+	if result == nil || !result.IsError || len(result.Content) != 1 {
+		t.Fatalf("expected one MCP tool error, got %#v", result)
+	}
+	text, ok := result.Content[0].(*mcp.TextContent)
+	if !ok {
+		t.Fatalf("unexpected MCP error content: %#v", result.Content[0])
+	}
+	if strings.Contains(text.Text, receiveCode) {
+		t.Fatalf("share receive code leaked in MCP error: %s", text.Text)
+	}
+	if !strings.Contains(text.Text, "[REDACTED]") {
+		t.Fatalf("redacted marker missing from MCP error: %s", text.Text)
+	}
+}
+
+func TestDownloadShareThroughTransferUsesShareRefreshAndHashedIdentity(t *testing.T) {
+	const (
+		shareCode   = "secret-share-code"
+		receiveCode = "secret-receive-code"
+		fileID      = "file-id-with-hyphens"
+	)
+	worker := mcpTestNetworkPath("Ethernet 1", 1, "10.0.0.1")
+	apiCalls := 0
+	client := driver.New(driver.WithRestyClient(resty.NewWithClient(&http.Client{Transport: mcpTestRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+		apiCalls++
+		if got := req.URL.Query().Get("share_code"); got != shareCode {
+			t.Fatalf("share refresh code = %q, want %q", got, shareCode)
+		}
+		if got := req.URL.Query().Get("receive_code"); got != receiveCode {
+			t.Fatalf("share refresh receive code = %q, want %q", got, receiveCode)
+		}
+		if got := req.URL.Query().Get("file_id"); got != fileID {
+			t.Fatalf("share refresh file id = %q, want %q", got, fileID)
+		}
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header: http.Header{
+				"Content-Type": {"application/json"},
+				"Set-Cookie":   {"refresh-cookie=secret; Path=/"},
+			},
+			Body:    io.NopCloser(strings.NewReader(`{"state":true,"data":{"fid":"file-id-with-hyphens","fn":"file.bin","fs":"100","url":{"url":"https://cdn.example.invalid/fresh?token=two"}}}`)),
+			Request: req,
+		}, nil
+	})})))
+	config := DefaultDownloadTransferConfig()
+	config.URLRefreshes = 1
+	ft := NewFileTools(client, WithDownloadTransferConfig(config))
+	probeCalls := 0
+	ft.downloadTransfer.deps = mcpDownloadTransferDeps{
+		discoverNetworkPaths: func(context.Context) (transfer.NetworkDiscoveryResult, error) {
+			return transfer.NetworkDiscoveryResult{Paths: []transfer.NetworkPath{worker}, Probes: []transfer.NetworkPathProbe{{Path: worker, Reachable: true}}}, nil
+		},
+		listNetworkPaths: func() ([]transfer.NetworkPath, error) { return nil, errors.New("unexpected manual listing") },
+		probeCDNPaths: func(_ context.Context, rawURL string, headers http.Header, paths []transfer.NetworkPath, _ *transfer.CDNProbeCache, _ ...transfer.CDNProbeOption) (transfer.CDNDiscoveryResult, error) {
+			probeCalls++
+			if len(paths) != 1 || paths[0].InterfaceIndex != worker.InterfaceIndex {
+				t.Fatalf("unexpected share CDN paths: %#v", paths)
+			}
+			if probeCalls == 1 && rawURL != "https://cdn.example.invalid/old?token=one" {
+				t.Fatalf("unexpected initial share URL: %q", rawURL)
+			}
+			if probeCalls == 2 {
+				if rawURL != "https://cdn.example.invalid/fresh?token=two" {
+					t.Fatalf("unexpected refreshed share URL: %q", rawURL)
+				}
+				if !strings.Contains(headers.Get("Referer"), receiveCode) || !strings.Contains(headers.Get("Cookie"), "refresh-cookie=secret") {
+					t.Fatalf("refreshed share headers were not preserved internally: %#v", headers)
+				}
+			}
+			return transfer.CDNDiscoveryResult{Host: "cdn.example.invalid", Paths: []transfer.NetworkPath{worker}}, nil
+		},
+		scheduleFiles: func(ctx context.Context, _ []transfer.NetworkPath, jobs []transfer.FileTransferJob, _ ...transfer.FileSchedulerOption) (transfer.FileScheduleReport, error) {
+			if len(jobs) != 1 {
+				t.Fatalf("expected one share job, got %d", len(jobs))
+			}
+			job := jobs[0]
+			for _, secret := range []string{shareCode, receiveCode, fileID} {
+				if strings.Contains(job.ID, secret) || strings.Contains(job.ResumeKey, secret) {
+					t.Fatalf("share secret/identity leaked into scheduler identity: job=%q resume=%q", job.ID, job.ResumeKey)
+				}
+			}
+			if job.ID == "" || job.ResumeKey == "" || job.ID != job.ResumeKey {
+				t.Fatalf("unexpected hashed share identity: job=%q resume=%q", job.ID, job.ResumeKey)
+			}
+			if job.Refresh == nil {
+				t.Fatal("share URL refresh callback was not configured")
+			}
+			fresh, err := job.Refresh(ctx)
+			if err != nil {
+				t.Fatalf("share refresh failed: %v", err)
+			}
+			if fresh.URL != "https://cdn.example.invalid/fresh?token=two" {
+				t.Fatalf("unexpected refreshed source: %#v", fresh)
+			}
+			return transfer.FileScheduleReport{Results: []transfer.FileScheduleResult{{JobID: job.ID, Result: transfer.FileDownloadResult{DestinationPath: job.DestinationPath, BytesWritten: 100, StatusCode: http.StatusOK}}}}, nil
+		},
+		downloadChunks: func(context.Context, transfer.ChunkDownloadRequest) (transfer.ChunkDownloadResult, error) {
+			t.Fatal("chunk downloader should not run in file strategy")
+			return transfer.ChunkDownloadResult{}, nil
+		},
+	}
+	initial := &driver.SharedDownloadRequest{
+		SharedDownloadInfo: driver.SharedDownloadInfo{FileID: fileID, FileName: "file.bin", FileSize: 100},
+		Header:             http.Header{"Referer": {"https://115cdn.com/s/redacted"}},
+	}
+	initial.URL.URL = "https://cdn.example.invalid/old?token=one"
+	result, err := ft.downloadShareThroughTransfer(context.Background(), initial, filepath.Join("root", "file.bin"), shareCode, receiveCode, fileID, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.BytesWritten != 100 || apiCalls != 1 || probeCalls != 2 {
+		t.Fatalf("unexpected share transfer result/calls: result=%#v api=%d probe=%d", result, apiCalls, probeCalls)
+	}
+}
+
+type mcpTestRoundTripFunc func(*http.Request) (*http.Response, error)
+
+func (fn mcpTestRoundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
+	return fn(req)
 }
 
 func mcpTestNetworkPath(name string, index int, ip string) transfer.NetworkPath {

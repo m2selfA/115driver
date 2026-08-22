@@ -30,5 +30,5 @@ func TestMarshalAccountInfoResult(t *testing.T) {
 	assert.Contains(t, decoded, "user")
 	assert.Contains(t, decoded, "space")
 	assert.Contains(t, decoded, "login_devices")
-	assert.Contains(t, decoded, "imei_info")
+	assert.NotContains(t, decoded, "imei_info")
 }

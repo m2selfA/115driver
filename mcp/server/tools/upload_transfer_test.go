@@ -4,12 +4,14 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/SheltonZhu/115driver/internal/transfer"
 	uploadpkg "github.com/SheltonZhu/115driver/internal/upload"
 	"github.com/SheltonZhu/115driver/pkg/driver"
+	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
 func TestMCPUploadThroughTransferWiresMachineTransferConfig(t *testing.T) {
@@ -61,6 +63,34 @@ func TestMCPUploadThroughTransferWiresMachineTransferConfig(t *testing.T) {
 	}
 }
 
+func TestMCPUploadThroughTransferPreparedForwardsReviewedDigest(t *testing.T) {
+	ft := NewFileTools(nil)
+	file, err := os.CreateTemp(t.TempDir(), "prepared-*.bin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+	if _, err := file.Write([]byte("data")); err != nil {
+		t.Fatal(err)
+	}
+	info, err := file.Stat()
+	if err != nil {
+		t.Fatal(err)
+	}
+	prepared := &uploadpkg.PreparedDigest{SHA1: "ABCDEF", Size: info.Size(), ModTimeUnixNano: info.ModTime().UnixNano()}
+	var captured *uploadpkg.PreparedDigest
+	ft.uploadTransfer.deps.uploadFile = func(_ context.Context, _ *driver.Pan115Client, _ string, _ string, _ int64, _ *os.File, options uploadpkg.Options) (uploadpkg.Result, error) {
+		captured = options.PreparedDigest
+		return uploadpkg.Result{}, nil
+	}
+	if _, err := ft.uploadThroughTransferPrepared(context.Background(), "0", "data.bin", info.Size(), file, prepared); err != nil {
+		t.Fatal(err)
+	}
+	if captured != prepared {
+		t.Fatalf("prepared digest was not forwarded by identity: got=%p want=%p", captured, prepared)
+	}
+}
+
 func TestUploadFromURLRejectsUnsafeTargetBeforeP10Uploader(t *testing.T) {
 	ft := NewFileTools(nil)
 	ft.uploadTransfer.deps.uploadFile = func(context.Context, *driver.Pan115Client, string, string, int64, *os.File, uploadpkg.Options) (uploadpkg.Result, error) {
@@ -73,6 +103,23 @@ func TestUploadFromURLRejectsUnsafeTargetBeforeP10Uploader(t *testing.T) {
 	}
 	if result == nil || !result.IsError {
 		t.Fatalf("expected SSRF rejection, got %#v", result)
+	}
+}
+
+func TestUploadFromURLRejectsInvalid115TargetBeforeExternalFetch(t *testing.T) {
+	lookups := 0
+	client := mcpUploadTargetTestClient(t, map[string]bool{"file-target": false}, &lookups)
+	ft := NewFileTools(client)
+	ft.uploadTransfer.deps.uploadFile = func(context.Context, *driver.Pan115Client, string, string, int64, *os.File, uploadpkg.Options) (uploadpkg.Result, error) {
+		t.Fatal("P10 uploader ran for invalid 115 target")
+		return uploadpkg.Result{}, nil
+	}
+	result, _, err := ft.uploadFromURL(context.Background(), nil, UploadFromURLArgs{URL: "https://example.com/file.bin", DirID: "file-target"})
+	if err != nil {
+		t.Fatalf("handler should return tool error, got Go error: %v", err)
+	}
+	if result == nil || !result.IsError || lookups != 1 {
+		t.Fatalf("invalid 115 target did not fail before external fetch: result=%#v lookups=%d", result, lookups)
 	}
 }
 
@@ -93,6 +140,49 @@ func TestUploadFromLocalRejectsOutsideRootBeforeP10Uploader(t *testing.T) {
 	}
 	if result == nil || !result.IsError {
 		t.Fatalf("expected local-root rejection, got %#v", result)
+	}
+}
+
+func TestUploadDryRunsRejectUnusableTransferConfigBeforeDataPath(t *testing.T) {
+	config := DefaultDownloadTransferConfig()
+	config.ChunkSize = "1B"
+	root := t.TempDir()
+	localPath := filepath.Join(root, "preview.bin")
+	if err := os.WriteFile(localPath, []byte("payload"), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	newTools := func() *FileTools {
+		return NewFileTools(nil, WithLocalRoot(root), WithDownloadTransferConfig(config))
+	}
+	calls := []struct {
+		name string
+		call func(*FileTools) (*mcp.CallToolResult, any, error)
+	}{
+		{name: "url", call: func(ft *FileTools) (*mcp.CallToolResult, any, error) {
+			return ft.uploadFromURL(context.Background(), nil, UploadFromURLArgs{URL: "https://example.invalid/file.bin", DirID: "0", DryRun: true})
+		}},
+		{name: "url-batch", call: func(ft *FileTools) (*mcp.CallToolResult, any, error) {
+			return ft.uploadFromURLs(context.Background(), nil, UploadFromURLFilesArgs{DryRun: true, Files: []UploadFromURLFileItem{{URL: "https://example.invalid/file.bin", DirID: "0"}}})
+		}},
+		{name: "local", call: func(ft *FileTools) (*mcp.CallToolResult, any, error) {
+			return ft.uploadFromLocal(context.Background(), nil, UploadFromLocalArgs{LocalPath: localPath, DirID: "0", DryRun: true})
+		}},
+		{name: "local-batch", call: func(ft *FileTools) (*mcp.CallToolResult, any, error) {
+			return ft.uploadFromLocalFiles(context.Background(), nil, UploadFromLocalFilesArgs{DryRun: true, Files: []UploadFromLocalFileItem{{LocalPath: localPath, DirID: "0"}}})
+		}},
+	}
+	for _, tc := range calls {
+		t.Run(tc.name, func(t *testing.T) {
+			result, _, err := tc.call(newTools())
+			if err != nil || result == nil || !result.IsError || len(result.Content) != 1 {
+				t.Fatalf("invalid-config %s dry-run = %#v, %v", tc.name, result, err)
+			}
+			text, ok := result.Content[0].(*mcp.TextContent)
+			if !ok || !strings.Contains(text.Text, "100KiB") {
+				t.Fatalf("invalid-config %s lost upload readiness cause: %#v", tc.name, result.Content[0])
+			}
+		})
 	}
 }
 

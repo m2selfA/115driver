@@ -45,15 +45,39 @@ const (
 	maxRecycleLimit     = 100
 )
 
+// MCPRecycleBinItem is a stable typed view of one recycle-bin entry.
+type MCPRecycleBinItem struct {
+	ID         string `json:"id"`
+	FileName   string `json:"file_name"`
+	FileSize   int64  `json:"file_size"`
+	ParentID   string `json:"cid"`
+	ParentName string `json:"parent_name"`
+	DeleteTime int64  `json:"dtime"`
+}
+
+// MCPRecycleListOutput wraps the legacy bare-array TextContent for structured output.
+type MCPRecycleListOutput struct {
+	Items []MCPRecycleBinItem `json:"items"`
+}
+
 // RevertRecycleArgs defines arguments for reverting recycle bin items
 type RevertRecycleArgs struct {
 	ItemIDs []string `json:"item_ids" jsonschema:"IDs of items to revert"`
+	DryRun  bool     `json:"dry_run,omitempty" jsonschema:"validate and preview item IDs without restoring anything"`
 }
 
 // CleanRecycleArgs defines arguments for cleaning recycle bin items
 type CleanRecycleArgs struct {
 	Password string   `json:"password" jsonschema:"password for cleaning recycle bin"`
 	ItemIDs  []string `json:"item_ids" jsonschema:"IDs of items to clean"`
+	DryRun   bool     `json:"dry_run,omitempty" jsonschema:"validate and preview item IDs without permanently deleting anything"`
+}
+
+type MCPRecycleMutationPlan struct {
+	Operation string   `json:"operation"`
+	DryRun    bool     `json:"dry_run"`
+	Requested int      `json:"requested"`
+	ItemIDs   []string `json:"item_ids"`
 }
 
 // RegisterTools registers recycle bin-related tools with the MCP server
@@ -61,23 +85,35 @@ func (rt *RecycleTools) RegisterTools(server *mcp.Server) {
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "listRecycleBin",
 		Description: "List items in the recycle bin",
+		Annotations: mcpReadOnlyToolAnnotations(),
 	}, rt.listRecycleBin)
+
+	mcp.AddTool(server, &mcp.Tool{
+		Name:        "list_recycle_pages",
+		Description: "List multiple independently paginated recycle-bin pages in one bounded read-only batch",
+		Annotations: mcpReadOnlyToolAnnotations(),
+	}, rt.listRecyclePages)
 
 	if rt.allowDestructive {
 		mcp.AddTool(server, &mcp.Tool{
 			Name:        "revertRecycleBin",
-			Description: "Revert items from the recycle bin",
-		}, rt.revertRecycleBin)
+			Description: "Restore recycle-bin items after full ID preflight; dry_run validates without changing state",
+			Annotations: mcpMutationToolAnnotations(false),
+		}, rt.revertRecycleBinTyped)
 
 		mcp.AddTool(server, &mcp.Tool{
 			Name:        "cleanRecycleBin",
-			Description: "Clean items from the recycle bin",
-		}, rt.cleanRecycleBin)
+			Description: "Permanently clean selected recycle-bin items after full ID preflight; dry_run validates without deleting",
+			Annotations: mcpDestructiveToolAnnotations(),
+		}, rt.cleanRecycleBinTyped)
 	}
 }
 
-func (rt *RecycleTools) listRecycleBin(ctx context.Context, req *mcp.CallToolRequest, args ListRecycleArgs) (*mcp.CallToolResult, any, error) {
-	offset, limit := normalizeRecyclePagination(args.Offset, args.Limit)
+func (rt *RecycleTools) listRecycleBin(ctx context.Context, req *mcp.CallToolRequest, args ListRecycleArgs) (*mcp.CallToolResult, MCPRecycleListOutput, error) {
+	offset, limit, paginationErr := validateRecyclePagination(args.Offset, args.Limit)
+	if paginationErr != nil {
+		return toolError(fmt.Sprintf("Invalid recycle pagination: %v", paginationErr)), MCPRecycleListOutput{}, nil
+	}
 
 	items, err := rt.client.ListRecycleBin(offset, limit)
 	if err != nil {
@@ -88,7 +124,7 @@ func (rt *RecycleTools) listRecycleBin(ctx context.Context, req *mcp.CallToolReq
 				},
 			},
 			IsError: true,
-		}, nil, nil
+		}, MCPRecycleListOutput{}, nil
 	}
 
 	resultJSON, err := json.Marshal(items)
@@ -100,8 +136,9 @@ func (rt *RecycleTools) listRecycleBin(ctx context.Context, req *mcp.CallToolReq
 				},
 			},
 			IsError: true,
-		}, nil, nil
+		}, MCPRecycleListOutput{}, nil
 	}
+	typedItems := mcpRecycleBinItems(items)
 
 	return &mcp.CallToolResult{
 		Content: []mcp.Content{
@@ -109,35 +146,38 @@ func (rt *RecycleTools) listRecycleBin(ctx context.Context, req *mcp.CallToolReq
 				Text: string(resultJSON),
 			},
 		},
-	}, nil, nil
+	}, MCPRecycleListOutput{Items: typedItems}, nil
 }
 
-func normalizeRecyclePagination(offset, limit int) (int, int) {
+func validateRecyclePagination(offset, limit int) (int, int, error) {
 	if offset < 0 {
-		offset = 0
+		return 0, 0, fmt.Errorf("offset must not be negative")
 	}
-	if limit <= 0 {
+	if limit < 0 {
+		return 0, 0, fmt.Errorf("limit must not be negative")
+	}
+	if limit == 0 {
 		limit = defaultRecycleLimit
 	}
 	if limit > maxRecycleLimit {
-		limit = maxRecycleLimit
+		return 0, 0, fmt.Errorf("limit must not exceed %d", maxRecycleLimit)
 	}
-	return offset, limit
+	return offset, limit, nil
 }
 
 func (rt *RecycleTools) revertRecycleBin(ctx context.Context, req *mcp.CallToolRequest, args RevertRecycleArgs) (*mcp.CallToolResult, any, error) {
-	if len(args.ItemIDs) == 0 {
-		return &mcp.CallToolResult{
-			Content: []mcp.Content{
-				&mcp.TextContent{
-					Text: "No item IDs provided",
-				},
-			},
-			IsError: true,
-		}, nil, nil
+	itemIDs, err := normalizeMCPUniqueStrings(args.ItemIDs, "recycle item ID", maxMCPMutationBatchItems)
+	if err != nil {
+		return toolError(fmt.Sprintf("Recycle restore preflight failed: %v", err)), nil, nil
+	}
+	if args.DryRun {
+		return mcpJSONResult(MCPRecycleMutationPlan{Operation: "revert_recycle", DryRun: true, Requested: len(itemIDs), ItemIDs: itemIDs}, "Failed to serialize recycle restore dry-run")
+	}
+	if rt.client == nil {
+		return toolError("115 client is unavailable"), nil, nil
 	}
 
-	err := rt.client.RevertRecycleBin(args.ItemIDs...)
+	err = rt.client.RevertRecycleBin(itemIDs...)
 	if err != nil {
 		return &mcp.CallToolResult{
 			Content: []mcp.Content{
@@ -159,18 +199,18 @@ func (rt *RecycleTools) revertRecycleBin(ctx context.Context, req *mcp.CallToolR
 }
 
 func (rt *RecycleTools) cleanRecycleBin(ctx context.Context, req *mcp.CallToolRequest, args CleanRecycleArgs) (*mcp.CallToolResult, any, error) {
-	if len(args.ItemIDs) == 0 {
-		return &mcp.CallToolResult{
-			Content: []mcp.Content{
-				&mcp.TextContent{
-					Text: "No item IDs provided",
-				},
-			},
-			IsError: true,
-		}, nil, nil
+	itemIDs, err := normalizeMCPUniqueStrings(args.ItemIDs, "recycle item ID", maxMCPMutationBatchItems)
+	if err != nil {
+		return toolError(fmt.Sprintf("Recycle clean preflight failed: %v", err)), nil, nil
+	}
+	if args.DryRun {
+		return mcpJSONResult(MCPRecycleMutationPlan{Operation: "clean_recycle", DryRun: true, Requested: len(itemIDs), ItemIDs: itemIDs}, "Failed to serialize recycle clean dry-run")
+	}
+	if rt.client == nil {
+		return toolError("115 client is unavailable"), nil, nil
 	}
 
-	err := rt.client.CleanRecycleBin(args.Password, args.ItemIDs...)
+	err = rt.client.CleanRecycleBin(args.Password, itemIDs...)
 	if err != nil {
 		return &mcp.CallToolResult{
 			Content: []mcp.Content{

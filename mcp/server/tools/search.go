@@ -25,10 +25,20 @@ func NewSearchTools(client *driver.Pan115Client) *SearchTools {
 type SearchArgs struct {
 	SearchValue string `json:"search_value" jsonschema:"search keyword"`
 	Offset      int    `json:"offset" jsonschema:"offset for pagination, default is 0"`
-	Limit       int    `json:"limit" jsonschema:"limit number of results, default is 30"`
+	Limit       int    `json:"limit" jsonschema:"limit number of results, default is 30, maximum is 500"`
 	Type        int    `json:"type" jsonschema:"file type filter, 0:all 1:folder 2:document 3:image 4:video 5:audio 6:archive"`
 	Order       string `json:"order" jsonschema:"sort field, e.g. file_name, user_ptime"`
 	Asc         int    `json:"asc" jsonschema:"ascending order, 0:descending 1:ascending"`
+}
+
+// MCPSearchResult is the stable typed view of the existing search JSON result.
+type MCPSearchResult struct {
+	Count    int                 `json:"count"`
+	Files    []MCPDirectoryEntry `json:"files"`
+	Offset   int                 `json:"offset"`
+	PageSize int                 `json:"page_size"`
+	Order    string              `json:"order"`
+	IsAsc    int                 `json:"is_asc"`
 }
 
 // RegisterTools registers search-related tools with the MCP server
@@ -36,10 +46,39 @@ func (st *SearchTools) RegisterTools(server *mcp.Server) {
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "search",
 		Description: "Search for files and directories in the 115 cloud storage",
+		Annotations: mcpReadOnlyToolAnnotations(),
 	}, st.search)
+
+	mcp.AddTool(server, &mcp.Tool{
+		Name:        "search_many",
+		Description: "Run multiple independently paginated 115 searches in one bounded read-only batch",
+		Annotations: mcpReadOnlyToolAnnotations(),
+	}, st.searchMany)
 }
 
-func (st *SearchTools) search(ctx context.Context, req *mcp.CallToolRequest, args SearchArgs) (*mcp.CallToolResult, any, error) {
+func validateMCPSearchArgs(args SearchArgs) error {
+	if args.Offset < 0 {
+		return fmt.Errorf("offset must not be negative")
+	}
+	if args.Limit < 0 {
+		return fmt.Errorf("limit must not be negative")
+	}
+	if args.Limit > maxMCPSearchBatchLimit {
+		return fmt.Errorf("limit must not exceed %d", maxMCPSearchBatchLimit)
+	}
+	if args.Type < 0 || args.Type > 6 {
+		return fmt.Errorf("type must be between 0 and 6")
+	}
+	if args.Asc != 0 && args.Asc != 1 {
+		return fmt.Errorf("asc must be 0 or 1")
+	}
+	return nil
+}
+
+func (st *SearchTools) search(ctx context.Context, req *mcp.CallToolRequest, args SearchArgs) (*mcp.CallToolResult, MCPSearchResult, error) {
+	if err := validateMCPSearchArgs(args); err != nil {
+		return toolError(fmt.Sprintf("Invalid search parameters: %v", err)), MCPSearchResult{}, nil
+	}
 	opts := &driver.SearchOption{
 		SearchValue: args.SearchValue,
 		Offset:      args.Offset,
@@ -58,10 +97,11 @@ func (st *SearchTools) search(ctx context.Context, req *mcp.CallToolRequest, arg
 				},
 			},
 			IsError: true,
-		}, nil, nil
+		}, MCPSearchResult{}, nil
 	}
 
-	// Convert files to a serializable format
+	// Preserve the historical TextContent shape while reusing the same typed
+	// conversion as search_many.
 	files := make([]map[string]interface{}, len(result.Files))
 	for i, file := range result.Files {
 		files[i] = map[string]interface{}{
@@ -79,13 +119,14 @@ func (st *SearchTools) search(ctx context.Context, req *mcp.CallToolRequest, arg
 	}
 
 	response := map[string]interface{}{
-		"count": result.Count,
-		"files": files,
-		"offset": result.Offset,
+		"count":     result.Count,
+		"files":     files,
+		"offset":    result.Offset,
 		"page_size": result.PageSize,
-		"order": result.Order,
-		"is_asc": result.IsAsc,
+		"order":     result.Order,
+		"is_asc":    result.IsAsc,
 	}
+	typed := mcpSearchResultFromDriver(result)
 
 	responseJSON, err := json.Marshal(response)
 	if err != nil {
@@ -96,14 +137,8 @@ func (st *SearchTools) search(ctx context.Context, req *mcp.CallToolRequest, arg
 				},
 			},
 			IsError: true,
-		}, nil, nil
+		}, MCPSearchResult{}, nil
 	}
 
-	return &mcp.CallToolResult{
-		Content: []mcp.Content{
-			&mcp.TextContent{
-				Text: string(responseJSON),
-			},
-		},
-	}, nil, nil
+	return mcpTypedTextResult(string(responseJSON), typed, false)
 }

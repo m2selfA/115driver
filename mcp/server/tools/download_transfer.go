@@ -2,6 +2,7 @@ package tools
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"net"
@@ -206,7 +207,89 @@ type mcpDownloadPathSelection struct {
 	candidates []transfer.NetworkPath
 }
 
+type mcpDownloadInfoRefreshFunc func(context.Context) (*driver.DownloadInfo, error)
+
 func (ft *FileTools) downloadThroughTransfer(ctx context.Context, info *driver.DownloadInfo, localPath, pickCode string, userAgents ...string) (transfer.FileDownloadResult, error) {
+	stablePickCode := strings.TrimSpace(pickCode)
+	if stablePickCode == "" && info != nil {
+		stablePickCode = strings.TrimSpace(info.PickCode)
+	}
+	userAgent := ""
+	if len(userAgents) > 0 {
+		userAgent = userAgents[0]
+	}
+	var refreshMetadata mcpDownloadInfoRefreshFunc
+	if ft.client != nil && stablePickCode != "" {
+		refreshMetadata = func(refreshCtx context.Context) (*driver.DownloadInfo, error) {
+			return ft.client.DownloadWithUA(stablePickCode, userAgent)
+		}
+	}
+	return ft.downloadThroughTransferWithRefresh(ctx, info, localPath, stablePickCode, refreshMetadata)
+}
+
+func mcpShareDownloadStableID(shareCode, fileID string) string {
+	digest := sha256.Sum256([]byte(strings.TrimSpace(shareCode) + "\x00" + strings.TrimSpace(fileID)))
+	return fmt.Sprintf("share-%x", digest[:16])
+}
+
+func sharedDownloadInfoAsDownloadInfo(info *driver.SharedDownloadRequest, stableID string) *driver.DownloadInfo {
+	if info == nil {
+		return nil
+	}
+	return &driver.DownloadInfo{
+		FileName: info.FileName,
+		FileSize: info.FileSize,
+		PickCode: stableID,
+		Url:      driver.FileDownloadUrl{Url: info.URL.URL},
+		Header:   info.Header.Clone(),
+	}
+}
+
+func sharedDownloadInfoForRequest(info *driver.SharedDownloadRequest, fileID, stableID string) (*driver.DownloadInfo, error) {
+	fileID = strings.TrimSpace(fileID)
+	if fileID == "" {
+		return nil, errors.New("share file id must be non-empty")
+	}
+	if info == nil {
+		return nil, errors.New("share download info is empty")
+	}
+	if responseID := strings.TrimSpace(info.FileID); responseID != "" && responseID != fileID {
+		return nil, fmt.Errorf("share download metadata ID mismatch: requested %q, received %q", fileID, responseID)
+	}
+	if strings.TrimSpace(info.URL.URL) == "" {
+		return nil, errors.New("share download info has no CDN URL")
+	}
+	if int64(info.FileSize) < 0 {
+		return nil, errors.New("share download info has invalid size")
+	}
+	return sharedDownloadInfoAsDownloadInfo(info, stableID), nil
+}
+
+func (ft *FileTools) downloadShareThroughTransfer(ctx context.Context, info *driver.SharedDownloadRequest, localPath, shareCode, receiveCode, fileID, userAgent string) (transfer.FileDownloadResult, error) {
+	shareCode = strings.TrimSpace(shareCode)
+	fileID = strings.TrimSpace(fileID)
+	if shareCode == "" || fileID == "" {
+		return transfer.FileDownloadResult{}, errors.New("share code and file id must be non-empty")
+	}
+	stableID := mcpShareDownloadStableID(shareCode, fileID)
+	validatedInfo, err := sharedDownloadInfoForRequest(info, fileID, stableID)
+	if err != nil {
+		return transfer.FileDownloadResult{}, err
+	}
+	var refreshMetadata mcpDownloadInfoRefreshFunc
+	if ft.client != nil {
+		refreshMetadata = func(refreshCtx context.Context) (*driver.DownloadInfo, error) {
+			fresh, err := ft.client.DownloadByShareCodeRequestWithUA(userAgent, shareCode, receiveCode, fileID)
+			if err != nil {
+				return nil, err
+			}
+			return sharedDownloadInfoForRequest(fresh, fileID, stableID)
+		}
+	}
+	return ft.downloadThroughTransferWithRefresh(ctx, validatedInfo, localPath, stableID, refreshMetadata)
+}
+
+func (ft *FileTools) downloadThroughTransferWithRefresh(ctx context.Context, info *driver.DownloadInfo, localPath, stablePickCode string, refreshMetadata mcpDownloadInfoRefreshFunc) (transfer.FileDownloadResult, error) {
 	if ft.downloadTransfer == nil {
 		ft.downloadTransfer = newMCPDownloadTransferState()
 	}
@@ -229,25 +312,17 @@ func (ft *FileTools) downloadThroughTransfer(ctx context.Context, info *driver.D
 	if config.Strategy == "chunk" && expectedSize < 0 {
 		return transfer.FileDownloadResult{}, transfer.ErrChunkRequiresKnownSize
 	}
-	stablePickCode := strings.TrimSpace(pickCode)
-	if stablePickCode == "" {
-		stablePickCode = strings.TrimSpace(info.PickCode)
-	}
-	userAgent := ""
-	if len(userAgents) > 0 {
-		userAgent = userAgents[0]
-	}
 	var cache *transfer.CDNProbeCache
 	var selectedPaths []transfer.NetworkPath
 	refresh := transfer.DownloadSourceRefreshFunc(nil)
-	if config.URLRefreshes > 0 && ft.client != nil && stablePickCode != "" {
+	if config.URLRefreshes > 0 && refreshMetadata != nil {
 		refresh = func(refreshCtx context.Context) (transfer.DownloadSource, error) {
 			if refreshCtx != nil {
 				if err := refreshCtx.Err(); err != nil {
 					return transfer.DownloadSource{}, err
 				}
 			}
-			fresh, err := ft.client.DownloadWithUA(stablePickCode, userAgent)
+			fresh, err := refreshMetadata(refreshCtx)
 			if err != nil {
 				return transfer.DownloadSource{}, err
 			}
@@ -309,6 +384,12 @@ func (ft *FileTools) downloadThroughTransfer(ctx context.Context, info *driver.D
 	}
 	if len(selectedPaths) == 0 && expectedSize > 0 {
 		return transfer.FileDownloadResult{}, fmt.Errorf("no selected network interface can reach 115 CDN host %q", cdn.Host)
+	}
+	if expectedSize == 0 && len(selectedPaths) == 0 {
+		// An empty non-nil slice means "no eligible scheduler path". For a
+		// zero-byte file, let the file scheduler use its normal worker set so
+		// an inconclusive CDN probe does not become a synthetic hard reject.
+		selectedPaths = nil
 	}
 	if config.Strategy == "chunk" {
 		chunkSize, err := transfer.ParseByteSize(config.ChunkSize)

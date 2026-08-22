@@ -2,14 +2,30 @@ package server
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"time"
 
+	"github.com/SheltonZhu/115driver/internal/buildinfo"
+	syncjournalpkg "github.com/SheltonZhu/115driver/internal/syncjournal"
 	"github.com/SheltonZhu/115driver/mcp/server/tools"
 	"github.com/SheltonZhu/115driver/pkg/driver"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
+
+// Set via -ldflags for local/release builds. go install module@version falls
+// back to the module version embedded by the Go toolchain.
+var version = "dev"
+
+func serverVersion() string {
+	return buildinfo.Version(version)
+}
+
+// Version returns the build version advertised through MCP and CLI metadata.
+func Version() string {
+	return serverVersion()
+}
 
 // Server represents the 115driver MCP server
 type Server struct {
@@ -21,7 +37,9 @@ type Server struct {
 	urlUploadMaxBytes int64
 	downloadMaxBytes  int64
 	downloadTransfer  tools.DownloadTransferConfig
+	syncJournalStore  *syncjournalpkg.Store
 	allowDestructive  bool
+	allowSensitive    bool
 }
 
 // NewServer creates a new 115driver MCP server
@@ -33,7 +51,7 @@ func NewServer() *Server {
 		downloadTransfer:  tools.DefaultDownloadTransferConfig(),
 		mcpServer: mcp.NewServer(&mcp.Implementation{
 			Name:    "115driver-mcp-server",
-			Version: "1.0.0",
+			Version: serverVersion(),
 		}, nil),
 	}
 }
@@ -75,16 +93,37 @@ func (s *Server) WithDownloadTransferConfig(config tools.DownloadTransferConfig)
 	return s
 }
 
+// WithSyncJournalStore enables persistent current-schema sync execution
+// journals. A nil store preserves the historical stateless executor behavior.
+func (s *Server) WithSyncJournalStore(store *syncjournalpkg.Store) *Server {
+	s.syncJournalStore = store
+	return s
+}
+
 // WithDestructiveTools controls MCP tools that mutate 115 cloud state.
 func (s *Server) WithDestructiveTools(allow bool) *Server {
 	s.allowDestructive = allow
 	return s
 }
 
+// WithSensitiveTools controls MCP tools that return signed URLs or credential-like data.
+func (s *Server) WithSensitiveTools(allow bool) *Server {
+	s.allowSensitive = allow
+	return s
+}
+
 // Start runs the MCP server
 func (s *Server) Start(ctx context.Context) error {
+	normalizedRoot, err := tools.NormalizeLocalRoot(s.localRoot)
+	if err != nil {
+		return fmt.Errorf("invalid MCP local root: %w", err)
+	}
+	s.localRoot = normalizedRoot
 	if err := s.downloadTransfer.Validate(); err != nil {
 		return fmt.Errorf("invalid MCP download transfer configuration: %w", err)
+	}
+	if s.client == nil {
+		return errors.New("MCP driver client is required")
 	}
 	// Register all tools
 	s.registerTools()
@@ -115,7 +154,9 @@ func (s *Server) registerTools() {
 		tools.WithURLUploadMaxBytes(s.urlUploadMaxBytes),
 		tools.WithDownloadMaxBytes(s.downloadMaxBytes),
 		tools.WithDownloadTransferConfig(s.downloadTransfer),
+		tools.WithSyncJournalStore(s.syncJournalStore),
 		tools.WithDestructiveTools(s.allowDestructive),
+		tools.WithSensitiveTools(s.allowSensitive),
 	)
 	fileTools.RegisterTools(s.mcpServer)
 

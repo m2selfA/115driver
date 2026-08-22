@@ -59,9 +59,38 @@ func (state *mcpUploadTransferState) healthTracker(config DownloadTransferConfig
 	return health, nil
 }
 
-func (ft *FileTools) uploadThroughTransfer(ctx context.Context, dirID, fileName string, fileSize int64, file *os.File) (uploadpkg.Result, error) {
+func (ft *FileTools) validateUploadTransferReadiness() error {
 	if ft.uploadTransfer == nil {
 		ft.uploadTransfer = newMCPUploadTransferState()
+	}
+	state := ft.uploadTransfer
+	config := normalizeDownloadTransferConfig(state.config)
+	if err := config.Validate(); err != nil {
+		return err
+	}
+	if state.deps.uploadFile == nil {
+		return errors.New("upload transfer implementation is nil")
+	}
+	chunkSize, err := transfer.ParseByteSize(config.ChunkSize)
+	if err != nil {
+		return err
+	}
+	if chunkSize < uploadpkg.MinPartSize {
+		return errors.New("upload chunk size must be at least 100KiB")
+	}
+	return nil
+}
+
+func (ft *FileTools) uploadThroughTransfer(ctx context.Context, dirID, fileName string, fileSize int64, file *os.File) (uploadpkg.Result, error) {
+	return ft.uploadThroughTransferPrepared(ctx, dirID, fileName, fileSize, file, nil)
+}
+
+func (ft *FileTools) uploadThroughTransferPrepared(ctx context.Context, dirID, fileName string, fileSize int64, file *os.File, preparedDigest *uploadpkg.PreparedDigest) (uploadpkg.Result, error) {
+	if ft.uploadTransfer == nil {
+		ft.uploadTransfer = newMCPUploadTransferState()
+	}
+	if err := ft.validateUploadTransferReadiness(); err != nil {
+		return uploadpkg.Result{}, err
 	}
 	state := ft.uploadTransfer
 	config := normalizeDownloadTransferConfig(state.config)
@@ -92,5 +121,6 @@ func (ft *FileTools) uploadThroughTransfer(ctx context.Context, dirID, fileName 
 		WorkersPerInterface: config.WorkersPerInterface,
 		Timeout:             uploadpkg.DefaultTimeout,
 		HealthTracker:       health,
+		PreparedDigest:      preparedDigest,
 	})
 }
