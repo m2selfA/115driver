@@ -23,7 +23,18 @@ func readReleaseContractFile(t *testing.T, root, rel string) string {
 	if err != nil {
 		t.Fatalf("read %s: %v", filepath.ToSlash(rel), err)
 	}
-	return string(body)
+	return strings.ReplaceAll(string(body), "\r\n", "\n")
+}
+
+func TestReadReleaseContractFileNormalizesCRLF(t *testing.T) {
+	root := t.TempDir()
+	const rel = "contract.txt"
+	if err := os.WriteFile(filepath.Join(root, rel), []byte("alpha\r\nbeta\r\n"), 0o600); err != nil {
+		t.Fatalf("write CRLF release contract fixture: %v", err)
+	}
+	if got := readReleaseContractFile(t, root, rel); got != "alpha\nbeta\n" {
+		t.Fatalf("normalized release contract = %q, want LF-only content", got)
+	}
 }
 
 func TestReleasePackagingContractPinsDualEntrypointsAndMatrix(t *testing.T) {
