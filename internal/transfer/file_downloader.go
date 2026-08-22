@@ -30,6 +30,7 @@ type FileDownloadRequest struct {
 	MaxBytes        int64
 	Timeout         time.Duration
 	ResumeKey       string
+	ResumeStatePath string
 	Refresh         DownloadSourceRefreshFunc
 	MaxRefreshes    int
 
@@ -113,7 +114,7 @@ func downloadFile(ctx context.Context, request FileDownloadRequest, factory tran
 	}
 	client := &http.Client{Transport: transport, Timeout: request.Timeout}
 
-	artifacts, offset, err := openFileResume(request.DestinationPath, request.ResumeKey, request.ExpectedSize)
+	artifacts, offset, err := openFileResumeWithStatePath(request.DestinationPath, request.ResumeKey, request.ExpectedSize, request.ResumeStatePath)
 	if err != nil {
 		return result, err
 	}

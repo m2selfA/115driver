@@ -34,6 +34,7 @@ type FileTransferJob struct {
 	MaxBytes        int64
 	Timeout         time.Duration
 	ResumeKey       string
+	ResumeStatePath string
 	Refresh         DownloadSourceRefreshFunc
 	MaxRefreshes    int
 }
@@ -524,6 +525,7 @@ func (job FileTransferJob) downloadRequest(path NetworkPath, source *downloadSou
 		MaxBytes:        job.MaxBytes,
 		Timeout:         job.Timeout,
 		ResumeKey:       job.ResumeKey,
+		ResumeStatePath: job.ResumeStatePath,
 		Refresh:         job.Refresh,
 		MaxRefreshes:    job.MaxRefreshes,
 		source:          source,

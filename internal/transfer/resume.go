@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 )
 
@@ -26,16 +27,21 @@ type resumeMetadata struct {
 }
 
 type resumeArtifacts struct {
-	mu         sync.Mutex
-	file       *os.File
-	partPath   string
-	statePath  string
-	persistent bool
-	fresh      bool
-	metadata   resumeMetadata
+	mu              sync.Mutex
+	file            *os.File
+	partPath        string
+	statePath       string
+	legacyStatePath string
+	persistent      bool
+	fresh           bool
+	metadata        resumeMetadata
 }
 
 func openFileResume(destination, key string, expectedSize int64) (*resumeArtifacts, int64, error) {
+	return openFileResumeWithStatePath(destination, key, expectedSize, "")
+}
+
+func openFileResumeWithStatePath(destination, key string, expectedSize int64, statePath string) (*resumeArtifacts, int64, error) {
 	if err := os.MkdirAll(filepath.Dir(destination), 0755); err != nil {
 		return nil, 0, fmt.Errorf("create download directory: %w", err)
 	}
@@ -49,7 +55,7 @@ func openFileResume(destination, key string, expectedSize int64) (*resumeArtifac
 
 	artifacts, err := openPersistentResume(destination, resumeMetadata{
 		Version: resumeStateVersion, Mode: "file", KeyHash: resumeKeyHash(key), ExpectedSize: expectedSize,
-	})
+	}, statePath)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -60,15 +66,19 @@ func openFileResume(destination, key string, expectedSize int64) (*resumeArtifac
 	}
 	if info.Size() < 0 || info.Size() > expectedSize {
 		artifacts.closeOnFailure()
-		if err := clearPersistentResume(destination); err != nil {
+		if err := clearPersistentResumeWithStatePath(destination, statePath); err != nil {
 			return nil, 0, err
 		}
-		return openFileResume(destination, key, expectedSize)
+		return openFileResumeWithStatePath(destination, key, expectedSize, statePath)
 	}
 	return artifacts, info.Size(), nil
 }
 
 func openChunkResume(destination, key string, expectedSize, chunkSize int64, chunkCount int) (*resumeArtifacts, map[int]struct{}, error) {
+	return openChunkResumeWithStatePath(destination, key, expectedSize, chunkSize, chunkCount, "")
+}
+
+func openChunkResumeWithStatePath(destination, key string, expectedSize, chunkSize int64, chunkCount int, statePath string) (*resumeArtifacts, map[int]struct{}, error) {
 	if err := os.MkdirAll(filepath.Dir(destination), 0755); err != nil {
 		return nil, nil, fmt.Errorf("create chunk download directory: %w", err)
 	}
@@ -88,7 +98,7 @@ func openChunkResume(destination, key string, expectedSize, chunkSize int64, chu
 	wanted := resumeMetadata{
 		Version: resumeStateVersion, Mode: "chunk", KeyHash: resumeKeyHash(key), ExpectedSize: expectedSize, ChunkSize: chunkSize,
 	}
-	artifacts, err := openPersistentResume(destination, wanted)
+	artifacts, err := openPersistentResume(destination, wanted, statePath)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -104,32 +114,56 @@ func openChunkResume(destination, key string, expectedSize, chunkSize int64, chu
 		}
 	} else if info.Size() != expectedSize {
 		artifacts.closeOnFailure()
-		if err := clearPersistentResume(destination); err != nil {
+		if err := clearPersistentResumeWithStatePath(destination, statePath); err != nil {
 			return nil, nil, err
 		}
-		return openChunkResume(destination, key, expectedSize, chunkSize, chunkCount)
+		return openChunkResumeWithStatePath(destination, key, expectedSize, chunkSize, chunkCount, statePath)
 	}
 	completed := make(map[int]struct{}, len(artifacts.metadata.Completed))
 	for _, index := range artifacts.metadata.Completed {
 		if index < 0 || index >= chunkCount {
 			artifacts.closeOnFailure()
-			if err := clearPersistentResume(destination); err != nil {
+			if err := clearPersistentResumeWithStatePath(destination, statePath); err != nil {
 				return nil, nil, err
 			}
-			return openChunkResume(destination, key, expectedSize, chunkSize, chunkCount)
+			return openChunkResumeWithStatePath(destination, key, expectedSize, chunkSize, chunkCount, statePath)
 		}
 		completed[index] = struct{}{}
 	}
 	return artifacts, completed, nil
 }
 
-func openPersistentResume(destination string, wanted resumeMetadata) (*resumeArtifacts, error) {
-	partPath, statePath := resumeArtifactPaths(destination)
+func openPersistentResume(destination string, wanted resumeMetadata, statePathOverride string) (*resumeArtifacts, error) {
+	partPath, statePath := resumeArtifactPathsWithStatePath(destination, statePathOverride)
+	_, legacyStatePath := resumeArtifactPaths(destination)
+	if filepath.Clean(legacyStatePath) == filepath.Clean(statePath) {
+		legacyStatePath = ""
+	}
 	if err := rejectResumeSymlink(partPath); err != nil {
 		return nil, err
 	}
 	if err := rejectResumeSymlink(statePath); err != nil {
 		return nil, err
+	}
+	if legacyStatePath != "" {
+		if err := rejectResumeSymlink(legacyStatePath); err != nil {
+			return nil, err
+		}
+	}
+	if err := os.MkdirAll(filepath.Dir(statePath), 0700); err != nil {
+		return nil, fmt.Errorf("create download resume metadata directory: %w", err)
+	}
+	if legacyStatePath != "" {
+		if _, err := os.Lstat(statePath); os.IsNotExist(err) {
+			legacyMetadata, legacyErr := readResumeMetadata(legacyStatePath)
+			partInfo, partErr := os.Stat(partPath)
+			if legacyErr == nil && partErr == nil && partInfo.Mode().IsRegular() && legacyMetadata.matches(wanted) {
+				if err := writeResumeMetadataAtomic(statePath, legacyMetadata); err != nil {
+					return nil, fmt.Errorf("migrate download resume metadata: %w", err)
+				}
+				_ = removeIfExists(legacyStatePath)
+			}
+		}
 	}
 
 	metadata, stateErr := readResumeMetadata(statePath)
@@ -142,11 +176,16 @@ func openPersistentResume(destination string, wanted resumeMetadata) (*resumeArt
 		if err := removeIfExists(statePath); err != nil {
 			return nil, fmt.Errorf("clear stale resume metadata: %w", err)
 		}
+		if legacyStatePath != "" {
+			if err := removeIfExists(legacyStatePath); err != nil {
+				return nil, fmt.Errorf("clear stale legacy resume metadata: %w", err)
+			}
+		}
 		file, err := os.OpenFile(partPath, os.O_CREATE|os.O_EXCL|os.O_RDWR, 0600)
 		if err != nil {
 			return nil, fmt.Errorf("create resumable download part: %w", err)
 		}
-		artifacts := &resumeArtifacts{file: file, partPath: partPath, statePath: statePath, persistent: true, fresh: true, metadata: wanted}
+		artifacts := &resumeArtifacts{file: file, partPath: partPath, statePath: statePath, legacyStatePath: legacyStatePath, persistent: true, fresh: true, metadata: wanted}
 		if err := artifacts.persistMetadata(); err != nil {
 			file.Close()
 			removeIfExists(partPath)
@@ -159,7 +198,7 @@ func openPersistentResume(destination string, wanted resumeMetadata) (*resumeArt
 	if err != nil {
 		return nil, fmt.Errorf("open resumable download part: %w", err)
 	}
-	return &resumeArtifacts{file: file, partPath: partPath, statePath: statePath, persistent: true, metadata: metadata}, nil
+	return &resumeArtifacts{file: file, partPath: partPath, statePath: statePath, legacyStatePath: legacyStatePath, persistent: true, metadata: metadata}, nil
 }
 
 func (artifacts *resumeArtifacts) markChunkComplete(index int) error {
@@ -191,11 +230,24 @@ func (artifacts *resumeArtifacts) persistMetadata() error {
 	if artifacts == nil || !artifacts.persistent {
 		return nil
 	}
-	encoded, err := json.Marshal(artifacts.metadata)
+	if err := writeResumeMetadataAtomic(artifacts.statePath, artifacts.metadata); err != nil {
+		return err
+	}
+	if _, err := TouchManagedSessionForStatePath(artifacts.statePath, true); err != nil {
+		return err
+	}
+	return nil
+}
+
+func writeResumeMetadataAtomic(statePath string, metadata resumeMetadata) error {
+	encoded, err := json.Marshal(metadata)
 	if err != nil {
 		return fmt.Errorf("encode resume metadata: %w", err)
 	}
-	tmp, err := os.CreateTemp(filepath.Dir(artifacts.statePath), "."+filepath.Base(artifacts.statePath)+".*")
+	if err := os.MkdirAll(filepath.Dir(statePath), 0700); err != nil {
+		return fmt.Errorf("create resume metadata directory: %w", err)
+	}
+	tmp, err := os.CreateTemp(filepath.Dir(statePath), "."+filepath.Base(statePath)+".*")
 	if err != nil {
 		return fmt.Errorf("create resume metadata temp file: %w", err)
 	}
@@ -206,18 +258,22 @@ func (artifacts *resumeArtifacts) persistMetadata() error {
 			_ = os.Remove(tmpPath)
 		}
 	}()
+	if err := tmp.Chmod(0600); err != nil {
+		_ = tmp.Close()
+		return fmt.Errorf("secure resume metadata temp file: %w", err)
+	}
 	if _, err := tmp.Write(encoded); err != nil {
-		tmp.Close()
+		_ = tmp.Close()
 		return fmt.Errorf("write resume metadata: %w", err)
 	}
 	if err := tmp.Sync(); err != nil {
-		tmp.Close()
+		_ = tmp.Close()
 		return fmt.Errorf("sync resume metadata: %w", err)
 	}
 	if err := tmp.Close(); err != nil {
 		return fmt.Errorf("close resume metadata: %w", err)
 	}
-	if err := replaceDownloadedFile(tmpPath, artifacts.statePath); err != nil {
+	if err := replaceDownloadedFile(tmpPath, statePath); err != nil {
 		return fmt.Errorf("replace resume metadata: %w", err)
 	}
 	cleanup = false
@@ -237,6 +293,9 @@ func (artifacts *resumeArtifacts) replaceDestination(destination string) error {
 	}
 	if artifacts.persistent {
 		_ = removeIfExists(artifacts.statePath)
+		if artifacts.legacyStatePath != "" {
+			_ = removeIfExists(artifacts.legacyStatePath)
+		}
 	}
 	artifacts.partPath = ""
 	return nil
@@ -278,15 +337,35 @@ func resumeArtifactPaths(destination string) (string, string) {
 	return filepath.Join(dir, base+".part"), filepath.Join(dir, base+".resume.json")
 }
 
+func resumeArtifactPathsWithStatePath(destination, statePath string) (string, string) {
+	partPath, defaultStatePath := resumeArtifactPaths(destination)
+	if strings.TrimSpace(statePath) == "" {
+		return partPath, defaultStatePath
+	}
+	return partPath, filepath.Clean(statePath)
+}
+
 func clearPersistentResume(destination string) error {
-	partPath, statePath := resumeArtifactPaths(destination)
+	return clearPersistentResumeWithStatePath(destination, "")
+}
+
+func clearPersistentResumeWithStatePath(destination, statePathOverride string) error {
+	partPath, statePath := resumeArtifactPathsWithStatePath(destination, statePathOverride)
 	if err := rejectResumeSymlink(partPath); err != nil {
 		return err
 	}
 	if err := rejectResumeSymlink(statePath); err != nil {
 		return err
 	}
-	return errors.Join(removeIfExists(partPath), removeIfExists(statePath))
+	_, legacyStatePath := resumeArtifactPaths(destination)
+	legacyErr := error(nil)
+	if filepath.Clean(legacyStatePath) != filepath.Clean(statePath) {
+		if err := rejectResumeSymlink(legacyStatePath); err != nil {
+			return err
+		}
+		legacyErr = removeIfExists(legacyStatePath)
+	}
+	return errors.Join(removeIfExists(partPath), removeIfExists(statePath), legacyErr)
 }
 
 func rejectResumeSymlink(path string) error {

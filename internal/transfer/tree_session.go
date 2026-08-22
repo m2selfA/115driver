@@ -56,7 +56,36 @@ type TransferTreeSessionSnapshot struct {
 type TransferTreeSession struct {
 	mu       sync.Mutex
 	path     string
+	partsDir string
 	snapshot TransferTreeSessionSnapshot
+	lock     *SessionLock
+}
+
+func ValidateTransferTreeSession(path string, spec TransferTreeSessionSpec) (bool, error) {
+	if strings.TrimSpace(path) == "" {
+		return false, nil
+	}
+	if err := rejectTransferSessionSymlink(path); err != nil {
+		return false, err
+	}
+	data, err := os.ReadFile(path)
+	if os.IsNotExist(err) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("read legacy transfer session: %w", err)
+	}
+	var snapshot TransferTreeSessionSnapshot
+	if err := json.Unmarshal(data, &snapshot); err != nil {
+		return false, nil
+	}
+	if snapshot.Version != TransferTreeSessionVersion {
+		return false, nil
+	}
+	current := canonicalTransferTreeSessionSpec(spec)
+	keyHash := transferTreeSessionKeyHash(current)
+	legacySpec := canonicalTransferTreeSessionSpec(snapshot.Spec)
+	return snapshot.KeyHash == keyHash || transferTreeSessionKeyHash(legacySpec) == keyHash, nil
 }
 
 func OpenTransferTreeSession(path string, spec TransferTreeSessionSpec, directories []TransferTreeSessionDirectory, files []TransferTreeSessionFile) (*TransferTreeSession, error) {
@@ -122,6 +151,53 @@ func OpenTransferTreeSession(path string, spec TransferTreeSessionSpec, director
 		return nil, err
 	}
 	return session, nil
+}
+
+func (session *TransferTreeSession) SetPartsDir(partsDir string) {
+	if session == nil {
+		return
+	}
+	session.mu.Lock()
+	defer session.mu.Unlock()
+	session.partsDir = strings.TrimSpace(partsDir)
+}
+
+func (session *TransferTreeSession) PartsDir() string {
+	if session == nil {
+		return ""
+	}
+	session.mu.Lock()
+	defer session.mu.Unlock()
+	return session.partsDir
+}
+
+func (session *TransferTreeSession) AttachLock(lock *SessionLock) {
+	if session == nil || lock == nil {
+		return
+	}
+	session.mu.Lock()
+	defer session.mu.Unlock()
+	session.lock = lock
+}
+
+func (session *TransferTreeSession) Close() error {
+	if session == nil {
+		return nil
+	}
+	session.mu.Lock()
+	lock := session.lock
+	session.lock = nil
+	session.mu.Unlock()
+	if _, err := TouchManagedSessionForPayload(session.path, false); err != nil {
+		if lock != nil {
+			_ = lock.Close()
+		}
+		return err
+	}
+	if lock == nil {
+		return nil
+	}
+	return lock.Close()
 }
 
 func (session *TransferTreeSession) Path() string {
@@ -195,6 +271,14 @@ func (session *TransferTreeSession) Remove() error {
 	}
 	session.mu.Lock()
 	defer session.mu.Unlock()
+	if session.lock != nil {
+		if err := session.lock.StopLease(); err != nil {
+			return err
+		}
+	}
+	if managed, err := RemoveManagedSessionForPayload(session.path); managed || err != nil {
+		return err
+	}
 	if err := rejectTransferSessionSymlink(session.path); err != nil {
 		return err
 	}
@@ -263,6 +347,9 @@ func (session *TransferTreeSession) persistLocked() error {
 		return fmt.Errorf("replace transfer session: %w", err)
 	}
 	cleanup = false
+	if _, err := TouchManagedSessionForPayload(session.path, true); err != nil {
+		return err
+	}
 	return nil
 }
 

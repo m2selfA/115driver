@@ -1,6 +1,7 @@
 package transfer
 
 import (
+	"fmt"
 	"net"
 	"net/http"
 	"syscall"
@@ -42,7 +43,11 @@ func NewTransport(path NetworkPath) (*http.Transport, error) {
 		return nil, err
 	}
 
-	transport := http.DefaultTransport.(*http.Transport).Clone()
+	base, ok := http.DefaultTransport.(*http.Transport)
+	if !ok || base == nil {
+		return nil, fmt.Errorf("http.DefaultTransport has type %T; cannot clone a bound *http.Transport", http.DefaultTransport)
+	}
+	transport := base.Clone()
 	transport.DialContext = dialer.DialContext
 	return transport, nil
 }

@@ -275,6 +275,27 @@ func TestSequentialMultipartInitiatePreservesLegacySHA1Flags(t *testing.T) {
 	}
 }
 
+func TestAbortMultipartTreatsNoSuchUploadAsSuccess(t *testing.T) {
+	path := transfer.NetworkPath{InterfaceName: "Ethernet", InterfaceIndex: 1, LocalIP: net.ParseIP("10.0.0.1")}
+	pool := newOSSBucketPool(nil, "http://oss.example.invalid", "bucket")
+	pool.token = &driver.UploadOSSTokenResp{AccessKeyID: "ak", AccessKeySecret: "secret", SecurityToken: "sts", Expiration: time.Now().Add(time.Hour)}
+	pool.generation = 1
+	pool.refreshed = time.Now()
+	defer pool.close()
+	pool.transportFactory = func(transfer.NetworkPath) (http.RoundTripper, error) {
+		return uploadRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+			if req.Method != http.MethodDelete || req.URL.Query().Get("uploadId") != "gone-upload" {
+				t.Fatalf("unexpected abort request: %s %s", req.Method, req.URL.String())
+			}
+			return uploadTestHTTPResponse(req, http.StatusNotFound, http.Header{"Content-Type": []string{"application/xml"}}, `<Error><Code>NoSuchUpload</Code><Message>The specified upload does not exist.</Message><RequestId>req</RequestId><HostId>host</HostId></Error>`), nil
+		}), nil
+	}
+	imur := oss.InitiateMultipartUploadResult{Bucket: "bucket", Key: "object", UploadID: "gone-upload"}
+	if err := abortMultipart(pool, []transfer.NetworkPath{path}, imur); err != nil {
+		t.Fatalf("NoSuchUpload should make abort replay succeed: %v", err)
+	}
+}
+
 func TestUploadCallbackRequiresSequentialSHA1AndRemainsOpaque(t *testing.T) {
 	params := driver.UploadOSSParams{SHA1: "ABCDEF1234", Bucket: "bucket", Object: "object"}
 	params.Callback.Callback = `{"callbackBody":"sha1=${sha1}&name=${object}"}`

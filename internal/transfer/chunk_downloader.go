@@ -40,6 +40,7 @@ type ChunkDownloadRequest struct {
 	WorkersPerInterface int
 	HealthTracker       *NetworkHealthTracker
 	ResumeKey           string
+	ResumeStatePath     string
 	Refresh             DownloadSourceRefreshFunc
 	MaxRefreshes        int
 
@@ -185,7 +186,7 @@ func downloadFileByChunks(ctx context.Context, request ChunkDownloadRequest, fac
 	}
 	chunks := buildByteChunks(request.ExpectedSize, request.ChunkSize)
 	result.ChunkCount = len(chunks)
-	artifacts, completedSet, err := openChunkResume(request.DestinationPath, request.ResumeKey, request.ExpectedSize, request.ChunkSize, len(chunks))
+	artifacts, completedSet, err := openChunkResumeWithStatePath(request.DestinationPath, request.ResumeKey, request.ExpectedSize, request.ChunkSize, len(chunks), request.ResumeStatePath)
 	if err != nil {
 		return result, err
 	}

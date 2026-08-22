@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/SheltonZhu/115driver/internal/transfer"
 	"github.com/SheltonZhu/115driver/pkg/driver"
 )
 
@@ -44,6 +45,33 @@ type uploadResumeState struct {
 	// callback verification. It survives process restarts so recovery does not
 	// repeat a known-incompatible parallel completion path.
 	ForceSequential bool `json:"force_sequential,omitempty"`
+}
+
+func ValidateResumeStateIdentity(path, dirID, fileName string, fileSize int64, sha1 string) (bool, error) {
+	if strings.TrimSpace(path) == "" {
+		return false, nil
+	}
+	if err := rejectUploadResumeSymlink(path); err != nil {
+		return false, err
+	}
+	data, err := os.ReadFile(path)
+	if os.IsNotExist(err) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("read legacy upload resume state: %w", err)
+	}
+	var state uploadResumeState
+	if err := json.Unmarshal(data, &state); err != nil {
+		return false, nil
+	}
+	if state.Version != uploadResumeVersion || !state.matches(dirID, fileName, fileSize, sha1) {
+		return false, nil
+	}
+	if state.Phase != uploadResumePhasePrepared && state.Phase != uploadResumePhaseMultipart && state.Phase != uploadResumePhaseCompleted {
+		return false, nil
+	}
+	return true, nil
 }
 
 func loadUploadResume(path, dirID, fileName string, fileSize int64, sha1 string) (*uploadResumeState, error) {
@@ -124,6 +152,9 @@ func saveUploadResume(path string, state uploadResumeState) error {
 		return err
 	}
 	cleanup = false
+	if _, err := transfer.TouchManagedSessionForPayload(path, true); err != nil {
+		return err
+	}
 	return nil
 }
 

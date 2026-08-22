@@ -122,6 +122,27 @@ func TestNewTransportUsesBoundDialer(t *testing.T) {
 	}
 }
 
+type testRoundTripper func(*http.Request) (*http.Response, error)
+
+func (fn testRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
+	return fn(req)
+}
+
+func TestNewTransportReturnsErrorForCustomDefaultRoundTripper(t *testing.T) {
+	oldDefault := http.DefaultTransport
+	http.DefaultTransport = testRoundTripper(func(*http.Request) (*http.Response, error) { return nil, errors.New("unused") })
+	t.Cleanup(func() { http.DefaultTransport = oldDefault })
+
+	path := NetworkPath{InterfaceName: "ethernet", InterfaceIndex: 7, LocalIP: net.ParseIP("10.0.0.7")}
+	transport, err := NewTransport(path)
+	if err == nil || transport != nil {
+		t.Fatalf("NewTransport custom default = %#v, %v; want nil transport and error", transport, err)
+	}
+	if !strings.Contains(err.Error(), "cannot clone") {
+		t.Fatalf("NewTransport custom-default error = %v, want actionable clone error", err)
+	}
+}
+
 func httpDefaultTransportForTest() *http.Transport {
 	return http.DefaultTransport.(*http.Transport)
 }

@@ -371,8 +371,19 @@ func abortMultipart(pool *ossBucketPool, paths []transfer.NetworkPath, imur oss.
 			errs = append(errs, err)
 			continue
 		}
-		err = snapshot.handle.bucket.AbortMultipartUpload(imur, ossRequestOptions(abortCtx, snapshot.token)...)
-		if err == nil {
+		abort := func(current ossBucketSnapshot) error {
+			return current.handle.bucket.AbortMultipartUpload(imur, ossRequestOptions(abortCtx, current.token)...)
+		}
+		err = abort(snapshot)
+		if isOSSAuthError(err) {
+			refreshed, refreshErr := pool.refreshIfStale(path, snapshot.generation)
+			if refreshErr != nil {
+				err = errors.Join(err, refreshErr)
+			} else {
+				err = abort(refreshed)
+			}
+		}
+		if err == nil || isOSSNoSuchUpload(err) {
 			return nil
 		}
 		errs = append(errs, err)

@@ -49,6 +49,25 @@ func TestUploadResumeStateRoundTripAndIdentityReset(t *testing.T) {
 	}
 }
 
+func TestValidateResumeStateIdentityIsNonDestructive(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "legacy.upload.json")
+	state := newPreparedUploadResume("42", "file.bin", 123, "ABCDEF")
+	if err := saveUploadResume(path, state); err != nil {
+		t.Fatal(err)
+	}
+	valid, err := ValidateResumeStateIdentity(path, "42", "file.bin", 123, "abcdef")
+	if err != nil || !valid {
+		t.Fatalf("valid legacy state was rejected: valid=%v err=%v", valid, err)
+	}
+	valid, err = ValidateResumeStateIdentity(path, "42", "file.bin", 124, "ABCDEF")
+	if err != nil || valid {
+		t.Fatalf("mismatched legacy state was accepted: valid=%v err=%v", valid, err)
+	}
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("validator mutated legacy state: %v", err)
+	}
+}
+
 func TestUploadResumeStateRejectsSymlink(t *testing.T) {
 	dir := t.TempDir()
 	target := filepath.Join(dir, "target")

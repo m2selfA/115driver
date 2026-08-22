@@ -75,6 +75,107 @@ func TestDownloadFileResumesPersistentPartAcrossCalls(t *testing.T) {
 	assertResumeArtifactsRemoved(t, target)
 }
 
+func TestDownloadFileCentralResumeMetadataKeepsPartAtDestination(t *testing.T) {
+	data := []byte("abcdefgh")
+	root := t.TempDir()
+	target := filepath.Join(root, "movie.bin")
+	centralState := filepath.Join(t.TempDir(), "sessions", "payload.json")
+	request := testFileDownloadRequest(target, int64(len(data)))
+	request.ResumeKey = "pick-central-file"
+	request.ResumeStatePath = centralState
+
+	first, err := downloadFile(context.Background(), request, func(NetworkPath) (http.RoundTripper, error) {
+		return roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			return &http.Response{
+				StatusCode: http.StatusOK, ContentLength: -1, Header: make(http.Header),
+				Body: io.NopCloser(&p9BytesThenErrorReader{data: append([]byte(nil), data[:4]...), err: io.ErrUnexpectedEOF}), Request: req,
+			}, nil
+		}), nil
+	})
+	if !errors.Is(err, ErrNetworkPathFailure) || first.BytesWritten != 4 {
+		t.Fatalf("expected interrupted central resume: result=%#v err=%v", first, err)
+	}
+	partPath, legacyState := resumeArtifactPaths(target)
+	if info, statErr := os.Stat(partPath); statErr != nil || info.Size() != 4 {
+		t.Fatalf("destination-side part missing: info=%v err=%v", info, statErr)
+	}
+	if _, statErr := os.Stat(centralState); statErr != nil {
+		t.Fatalf("central resume metadata missing: %v", statErr)
+	}
+	if _, statErr := os.Stat(legacyState); !os.IsNotExist(statErr) {
+		t.Fatalf("legacy destination metadata should not be created: %v", statErr)
+	}
+
+	second, err := downloadFile(context.Background(), request, func(NetworkPath) (http.RoundTripper, error) {
+		return roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			if got := req.Header.Get("Range"); got != "bytes=4-" {
+				t.Fatalf("unexpected central resume Range: %q", got)
+			}
+			return &http.Response{
+				StatusCode: http.StatusPartialContent, ContentLength: 4,
+				Header: http.Header{"Content-Range": []string{"bytes 4-7/8"}},
+				Body:   io.NopCloser(strings.NewReader("efgh")), Request: req,
+			}, nil
+		}), nil
+	})
+	if err != nil || second.ResumedFrom != 4 {
+		t.Fatalf("central resume failed: result=%#v err=%v", second, err)
+	}
+	if got, readErr := os.ReadFile(target); readErr != nil || string(got) != string(data) {
+		t.Fatalf("central resumed file mismatch: %q err=%v", got, readErr)
+	}
+	if _, statErr := os.Stat(centralState); !os.IsNotExist(statErr) {
+		t.Fatalf("central metadata survived successful download: %v", statErr)
+	}
+}
+
+func TestDownloadFileMigratesLegacyDestinationResumeMetadata(t *testing.T) {
+	data := []byte("abcdefgh")
+	target := filepath.Join(t.TempDir(), "legacy.bin")
+	legacyRequest := testFileDownloadRequest(target, int64(len(data)))
+	legacyRequest.ResumeKey = "pick-legacy-file"
+	_, err := downloadFile(context.Background(), legacyRequest, func(NetworkPath) (http.RoundTripper, error) {
+		return roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			return &http.Response{
+				StatusCode: http.StatusOK, ContentLength: -1, Header: make(http.Header),
+				Body: io.NopCloser(&p9BytesThenErrorReader{data: []byte("abcd"), err: io.ErrUnexpectedEOF}), Request: req,
+			}, nil
+		}), nil
+	})
+	if err == nil {
+		t.Fatal("expected interrupted legacy download")
+	}
+	_, legacyState := resumeArtifactPaths(target)
+	if _, statErr := os.Stat(legacyState); statErr != nil {
+		t.Fatalf("legacy metadata missing before migration: %v", statErr)
+	}
+
+	centralState := filepath.Join(t.TempDir(), "managed", "payload.json")
+	request := legacyRequest
+	request.ResumeStatePath = centralState
+	result, err := downloadFile(context.Background(), request, func(NetworkPath) (http.RoundTripper, error) {
+		return roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			if got := req.Header.Get("Range"); got != "bytes=4-" {
+				t.Fatalf("legacy metadata was not migrated for resume: %q", got)
+			}
+			if _, statErr := os.Stat(centralState); statErr != nil {
+				t.Fatalf("central metadata not published before resumed request: %v", statErr)
+			}
+			if _, statErr := os.Stat(legacyState); !os.IsNotExist(statErr) {
+				t.Fatalf("legacy metadata still present after migration: %v", statErr)
+			}
+			return &http.Response{
+				StatusCode: http.StatusPartialContent, ContentLength: 4,
+				Header: http.Header{"Content-Range": []string{"bytes 4-7/8"}},
+				Body:   io.NopCloser(strings.NewReader("efgh")), Request: req,
+			}, nil
+		}), nil
+	})
+	if err != nil || result.ResumedFrom != 4 {
+		t.Fatalf("migrated legacy resume failed: result=%#v err=%v", result, err)
+	}
+}
+
 func TestDownloadFileResumeFallsBackWhenRangeIgnored(t *testing.T) {
 	data := []byte("abcdefgh")
 	target := filepath.Join(t.TempDir(), "fallback.bin")
@@ -238,6 +339,56 @@ func TestDownloadFileByChunksResumesOnlyIncompleteChunksAcrossCalls(t *testing.T
 		t.Fatalf("chunk resumed output mismatch: %q err=%v", got, err)
 	}
 	assertResumeArtifactsRemoved(t, target)
+}
+
+func TestDownloadFileByChunksUsesCentralResumeMetadata(t *testing.T) {
+	data := []byte("abcdefgh")
+	target := filepath.Join(t.TempDir(), "central-chunks.bin")
+	centralState := filepath.Join(t.TempDir(), "managed", "chunk.json")
+	path := testNetworkPath(1, "10.0.0.1")
+	request := ChunkDownloadRequest{
+		URL: "https://cdn.example.invalid/file", DestinationPath: target,
+		NetworkPaths: []NetworkPath{path}, ExpectedSize: int64(len(data)), ChunkSize: 4, Retries: 0,
+		ResumeKey: "pick-central-chunks", ResumeStatePath: centralState,
+	}
+	_, err := downloadFileByChunks(context.Background(), request, func(NetworkPath) (http.RoundTripper, error) {
+		return roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			start, end := mustParseRequestRange(t, req.Header.Get("Range"))
+			if start == 0 {
+				return chunkHTTPResponse(req, start, end, int64(len(data)), string(data[start:end+1])), nil
+			}
+			return nil, &url.Error{Op: "Get", URL: req.URL.String(), Err: errors.New("interrupted")}
+		}), nil
+	})
+	if !errors.Is(err, ErrChunkDownloadIncomplete) {
+		t.Fatalf("expected interrupted central chunk transfer, got %v", err)
+	}
+	partPath, legacyState := resumeArtifactPaths(target)
+	if info, statErr := os.Stat(partPath); statErr != nil || info.Size() != int64(len(data)) {
+		t.Fatalf("central chunk part not destination-side: info=%v err=%v", info, statErr)
+	}
+	if metadata, metaErr := readResumeMetadata(centralState); metaErr != nil || len(metadata.Completed) != 1 || metadata.Completed[0] != 0 {
+		t.Fatalf("central chunk metadata mismatch: %#v err=%v", metadata, metaErr)
+	}
+	if _, statErr := os.Stat(legacyState); !os.IsNotExist(statErr) {
+		t.Fatalf("legacy chunk metadata should not exist: %v", statErr)
+	}
+
+	result, err := downloadFileByChunks(context.Background(), request, func(NetworkPath) (http.RoundTripper, error) {
+		return roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			start, end := mustParseRequestRange(t, req.Header.Get("Range"))
+			if start == 0 {
+				t.Fatal("completed central chunk was downloaded again")
+			}
+			return chunkHTTPResponse(req, start, end, int64(len(data)), string(data[start:end+1])), nil
+		}), nil
+	})
+	if err != nil || result.ResumedChunks != 1 {
+		t.Fatalf("central chunk resume failed: result=%#v err=%v", result, err)
+	}
+	if _, statErr := os.Stat(centralState); !os.IsNotExist(statErr) {
+		t.Fatalf("central chunk metadata survived success: %v", statErr)
+	}
 }
 
 func TestDownloadFileByChunksRecoveryContinuesPersistedIncompleteChunks(t *testing.T) {

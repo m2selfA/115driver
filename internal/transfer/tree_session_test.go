@@ -113,6 +113,27 @@ func TestTransferTreeSessionWindowsAcceptsLegacyPathCasing(t *testing.T) {
 	}
 }
 
+func TestValidateTransferTreeSessionIsNonDestructive(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "legacy-tree.session.json")
+	spec := TransferTreeSessionSpec{Direction: "download", Source: "/remote", Destination: filepath.Join(t.TempDir(), "dst"), Strategy: "file"}
+	if _, err := OpenTransferTreeSession(path, spec, nil, []TransferTreeSessionFile{{RelativePath: "a.bin", Size: 1}}); err != nil {
+		t.Fatal(err)
+	}
+	valid, err := ValidateTransferTreeSession(path, spec)
+	if err != nil || !valid {
+		t.Fatalf("valid legacy tree state was rejected: valid=%v err=%v", valid, err)
+	}
+	other := spec
+	other.Source = "/other"
+	valid, err = ValidateTransferTreeSession(path, other)
+	if err != nil || valid {
+		t.Fatalf("mismatched legacy tree state was accepted: valid=%v err=%v", valid, err)
+	}
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("tree validator mutated legacy state: %v", err)
+	}
+}
+
 func TestTransferTreeSessionRejectsDifferentTransferAndSymlink(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "session.json")
