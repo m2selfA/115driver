@@ -8,7 +8,7 @@ import (
 
 func TestReleasePackagingContractR16IntegrationFreeze(t *testing.T) {
 	root := releaseContractRepoRoot(t)
-	audit := readReleaseContractFile(t, root, "V0.2.0_RC1_INTEGRATION_AUDIT.md")
+	audit := readReleaseContractFile(t, root, filepath.Join("docs", "release", "v0.2.0", "V0.2.0_RC1_INTEGRATION_AUDIT.md"))
 	for _, needle := range []string{
 		"Baseline: published `v0.1.4`",
 		"Planned candidate: `v0.2.0-rc.1`",
@@ -30,7 +30,7 @@ func TestReleasePackagingContractR16IntegrationFreeze(t *testing.T) {
 		}
 	}
 
-	notes := readReleaseContractFile(t, root, "RELEASE_NOTES_V0.2.0_RC1.md")
+	notes := readReleaseContractFile(t, root, filepath.Join("docs", "release", "v0.2.0", "RELEASE_NOTES_V0.2.0_RC1.md"))
 	for _, needle := range []string{
 		"pre-release draft",
 		"v0.2.0-rc.1",

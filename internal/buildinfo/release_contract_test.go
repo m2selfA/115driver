@@ -265,7 +265,7 @@ func TestReleasePackagingContractRunsBeforeGoReleaser(t *testing.T) {
 
 func TestReleasePackagingContractPinsR17CommitBoundary(t *testing.T) {
 	root := releaseContractRepoRoot(t)
-	manifest := readReleaseContractFile(t, root, "V0.2.0_RC1_COMMIT_MANIFEST.json")
+	manifest := readReleaseContractFile(t, root, filepath.Join("docs", "release", "v0.2.0", "V0.2.0_RC1_COMMIT_MANIFEST.json"))
 	for _, needle := range []string{
 		`"schema": "115driver.rc-commit-manifest/v1"`,
 		`"base_tag": "v0.1.4"`,
@@ -324,7 +324,7 @@ func TestReleasePackagingContractPinsR17CommitBoundary(t *testing.T) {
 
 	makefile := readReleaseContractFile(t, root, "Makefile")
 	for _, needle := range []string{
-		"RC_COMMIT_MANIFEST ?= V0.2.0_RC1_COMMIT_MANIFEST.json",
+		"RC_COMMIT_MANIFEST ?= docs/release/v0.2.0/V0.2.0_RC1_COMMIT_MANIFEST.json",
 		"verify-rc-commit-boundary:",
 		"$(GO) run ./cmd/release-boundary-check -manifest '$(RC_COMMIT_MANIFEST)'",
 		"test-release-packaging: test-release-entrypoints test-release-notes-cli test-release-ops verify-rc-commit-boundary",
@@ -337,6 +337,38 @@ func TestReleasePackagingContractPinsR17CommitBoundary(t *testing.T) {
 		if !strings.Contains(makefile, needle) {
 			t.Errorf("R17 Makefile boundary contract missing %q", needle)
 		}
+	}
+}
+
+func TestRepositoryLocalBuildAndDocsLayout(t *testing.T) {
+	root := releaseContractRepoRoot(t)
+	gitignore := readReleaseContractFile(t, root, ".gitignore")
+	if !strings.Contains(gitignore, "/.local-build/") {
+		t.Fatal("repository-local development build directory must be ignored")
+	}
+	makefile := readReleaseContractFile(t, root, "Makefile")
+	for _, needle := range []string{
+		"LOCAL_BIN_DIR ?= .local-build",
+		"LOCAL_VERSION ?= 0.2.1-dev+",
+		"local-build:",
+		"$(LOCAL_CLI_BIN)",
+		"$(LOCAL_MCP_BIN)",
+	} {
+		if !strings.Contains(makefile, needle) {
+			t.Errorf("local build contract missing %q", needle)
+		}
+	}
+
+	for _, name := range []string{
+		"RELEASE_CHECKLIST.md",
+		"RELEASE_NOTES_V0.2.0_RC1.md",
+		"V0.2.0_RC1_COMMIT_MANIFEST.json",
+		"V0.2.0_RC1_INTEGRATION_AUDIT.md",
+	} {
+		if _, err := os.Stat(filepath.Join(root, name)); !os.IsNotExist(err) {
+			t.Errorf("historical release document should not remain at repository root: %s (err=%v)", name, err)
+		}
+		_ = readReleaseContractFile(t, root, filepath.Join("docs", "release", "v0.2.0", name))
 	}
 }
 

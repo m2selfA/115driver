@@ -16,7 +16,7 @@ import (
 )
 
 func main() {
-	manifestPath := flag.String("manifest", "V0.2.0_RC1_COMMIT_MANIFEST.json", "RC commit-boundary manifest, relative to repository root unless absolute")
+	manifestPath := flag.String("manifest", "docs/release/v0.2.0/V0.2.0_RC1_COMMIT_MANIFEST.json", "RC commit-boundary manifest, relative to repository root unless absolute")
 	printLayer := flag.String("print-layer", "", "print the sorted paths for one verified layer")
 	printLayerNUL := flag.Bool("print-layer-nul", false, "emit -print-layer paths as NUL-delimited pathspec data")
 	verifyIndexLayer := flag.String("verify-index-layer", "", "verify the Git index contains exactly one frozen layer; use empty to require no staged paths")
@@ -57,7 +57,7 @@ func main() {
 		log.Fatalf("base tag %s is not an ancestor of HEAD: %v", manifest.BaseTag, err)
 	}
 
-	candidatePaths, err := collectCandidatePaths(root, manifest.BaseTag)
+	candidatePaths, err := collectCandidatePaths(root, manifest.BaseTag, manifest.CandidateTag)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -137,7 +137,22 @@ func ensureJSONEOF(decoder *json.Decoder) error {
 	return nil
 }
 
-func collectCandidatePaths(root, baseTag string) ([]string, error) {
+func collectCandidatePaths(root, baseTag, candidateTag string) ([]string, error) {
+	candidateExists, err := gitCommitExists(root, candidateTag)
+	if err != nil {
+		return nil, err
+	}
+	if candidateExists {
+		if err := gitRun(root, "merge-base", "--is-ancestor", baseTag, candidateTag); err != nil {
+			return nil, fmt.Errorf("RC candidate tag %s is not descended from base tag %s: %w", candidateTag, baseTag, err)
+		}
+		output, err := gitOutput(root, "diff", "--name-only", "--no-renames", baseTag+".."+candidateTag, "--")
+		if err != nil {
+			return nil, err
+		}
+		return nonEmptyGitPaths(output), nil
+	}
+
 	set := make(map[string]struct{})
 	queries := [][]string{
 		{"diff", "--name-only", "--no-renames", baseTag + "..HEAD", "--"},
@@ -149,11 +164,8 @@ func collectCandidatePaths(root, baseTag string) ([]string, error) {
 		if err != nil {
 			return nil, err
 		}
-		for _, line := range strings.Split(output, "\n") {
-			line = strings.TrimSpace(line)
-			if line != "" {
-				set[line] = struct{}{}
-			}
+		for _, path := range nonEmptyGitPaths(output) {
+			set[path] = struct{}{}
 		}
 	}
 	paths := make([]string, 0, len(set))
@@ -161,6 +173,33 @@ func collectCandidatePaths(root, baseTag string) ([]string, error) {
 		paths = append(paths, path)
 	}
 	return paths, nil
+}
+
+func nonEmptyGitPaths(output string) []string {
+	paths := make([]string, 0)
+	for _, line := range strings.Split(output, "\n") {
+		line = strings.TrimSpace(line)
+		if line != "" {
+			paths = append(paths, line)
+		}
+	}
+	return paths
+}
+
+func gitCommitExists(root, ref string) (bool, error) {
+	cmd := exec.Command("git", "rev-parse", "--verify", "--quiet", ref+"^{commit}")
+	if root != "" {
+		cmd.Dir = root
+	}
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		if exitErr, ok := err.(*exec.ExitError); ok && exitErr.ExitCode() == 1 {
+			return false, nil
+		}
+		return false, fmt.Errorf("git rev-parse --verify --quiet %s^{commit}: %w: %s", ref, err, strings.TrimSpace(stderr.String()))
+	}
+	return true, nil
 }
 
 func collectStagedPaths(root string) ([]string, error) {

@@ -19,6 +19,7 @@ coverage/
 # Local build and release outputs
 /bin/
 /dist/
+/.local-build/
 /115driver
 /115driver-mcp-server
 /mcp/115driver-mcp-server

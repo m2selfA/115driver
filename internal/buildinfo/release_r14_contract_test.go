@@ -111,7 +111,7 @@ func TestReleasePackagingContractR14OperationsGateAndChecklist(t *testing.T) {
 		t.Fatal("release artifact checker must report archive installation smoke explicitly")
 	}
 
-	checklist := readReleaseContractFile(t, root, "RELEASE_CHECKLIST.md")
+	checklist := readReleaseContractFile(t, root, filepath.Join("docs", "release", "v0.2.0", "RELEASE_CHECKLIST.md"))
 	for _, needle := range []string{
 		"# Release Candidate Checklist",
 		"release-dry-run",

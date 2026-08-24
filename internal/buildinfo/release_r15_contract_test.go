@@ -64,7 +64,7 @@ func TestReleasePackagingContractR15CandidateLineAndPromotionDocs(t *testing.T) 
 		}
 	}
 
-	checklist := readReleaseContractFile(t, root, "RELEASE_CHECKLIST.md")
+	checklist := readReleaseContractFile(t, root, filepath.Join("docs", "release", "v0.2.0", "RELEASE_CHECKLIST.md"))
 	for _, needle := range []string{
 		"`v0.2.0-rc.1`",
 		"`latest_published_tag`",

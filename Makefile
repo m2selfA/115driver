@@ -11,6 +11,10 @@ MCP_BIN ?= $(BIN_DIR)/115driver-mcp-server
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 CLI_LDFLAGS ?= -s -w -X github.com/SheltonZhu/115driver/cli/cmd.version=$(VERSION)
 MCP_LDFLAGS ?= -s -w -X github.com/SheltonZhu/115driver/mcp/server.version=$(VERSION)
+LOCAL_BIN_DIR ?= .local-build
+LOCAL_VERSION ?= 0.2.1-dev+$(shell git rev-parse --short=12 HEAD 2>/dev/null || echo unknown)
+LOCAL_CLI_BIN ?= $(LOCAL_BIN_DIR)/115driver$(shell $(GO) env GOEXE)
+LOCAL_MCP_BIN ?= $(LOCAL_BIN_DIR)/115driver-mcp-server$(shell $(GO) env GOEXE)
 ALIAS_REPAIR_CERT_COUNT ?= 10
 ALIAS_REPAIR_INTERNAL_RUN ?= ^Test(RemoveOrphanReviewAliasesExact|ExactRepairRawPlanLocks)
 ALIAS_REPAIR_CLI_RUN ?= ^Test(PlanCLISyncJournalAliasRepair|ReconcileCLISyncJournalAliasBatch|CLIAliasRepairBatchFailure|SyncJournalAliasBatch)
@@ -30,8 +34,7 @@ DIST_DIR ?= dist
 EXPECTED_ARTIFACT_VERSION ?=
 RELEASE_PREFLIGHT_SMOKE_TAG ?= v9.9.9-rc.1
 RELEASE_PREFLIGHT_SMOKE_SHA ?= 0123456789abcdef0123456789abcdef01234567
-RC_COMMIT_MANIFEST ?= V0.2.0_RC1_COMMIT_MANIFEST.json
-RC_COMMIT_MANIFEST ?= V0.2.0_RC1_COMMIT_MANIFEST.json
+RC_COMMIT_MANIFEST ?= docs/release/v0.2.0/V0.2.0_RC1_COMMIT_MANIFEST.json
 RC_COMMIT_LAYER ?=
 
 .DEFAULT_GOAL := help
@@ -191,6 +194,12 @@ build-mcp: $(BIN_DIR) ## Build the MCP server binary
 .PHONY: build
 build: build-cli build-mcp ## Build all binaries into bin/
 
+.PHONY: local-build
+local-build: ## Build ignored host-local CLI and MCP binaries into .local-build/
+	@mkdir -p $(LOCAL_BIN_DIR)
+	CGO_ENABLED=0 $(GO) build -trimpath -ldflags '-s -w -X github.com/SheltonZhu/115driver/cli/cmd.version=$(LOCAL_VERSION)' -o '$(LOCAL_CLI_BIN)' $(CLI_MAIN)
+	CGO_ENABLED=0 $(GO) build -trimpath -ldflags '-s -w -X github.com/SheltonZhu/115driver/mcp/server.version=$(LOCAL_VERSION)' -o '$(LOCAL_MCP_BIN)' $(MCP_MAIN)
+
 .PHONY: install-cli
 install-cli: ## Install the CLI binary with go install
 	CGO_ENABLED=0 $(GO) install -trimpath -ldflags '$(CLI_LDFLAGS)' $(CLI_MAIN)
@@ -208,7 +217,7 @@ pre-commit: ## Run all pre-commit hooks
 
 .PHONY: clean
 clean: ## Remove local build artifacts
-	rm -rf $(BIN_DIR)
+	rm -rf $(BIN_DIR) $(LOCAL_BIN_DIR)
 
 $(BIN_DIR):
 	mkdir -p $(BIN_DIR)
