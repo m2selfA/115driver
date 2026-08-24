@@ -215,6 +215,8 @@ func (store SessionStore) Open(identity SessionIdentityV2, displayName string, a
 	if err != nil {
 		return SessionLocation{}, SessionManifest{}, err
 	}
+	unlockManifest := lockSessionManifestPath(location.ManifestPath)
+	defer unlockManifest()
 	now := time.Now().UTC()
 	manifest := SessionManifest{
 		Version: SessionManifestVersion, SessionID: id, IdentitySHA256: fullHash, Identity: identity,
@@ -394,6 +396,8 @@ func TouchManagedSessionForStatePath(statePath string, persistentMutation bool) 
 		return false, nil
 	}
 	manifestPath := filepath.Join(dir, "session.json")
+	unlockManifest := lockSessionManifestPath(manifestPath)
+	defer unlockManifest()
 	data, err := os.ReadFile(manifestPath)
 	if os.IsNotExist(err) {
 		return false, nil
@@ -453,7 +457,10 @@ func RemoveManagedSessionForPayload(payloadPath string) (bool, error) {
 		return false, nil
 	}
 	dir := filepath.Dir(payloadPath)
-	data, err := os.ReadFile(filepath.Join(dir, "session.json"))
+	manifestPath := filepath.Join(dir, "session.json")
+	unlockManifest := lockSessionManifestPath(manifestPath)
+	defer unlockManifest()
+	data, err := os.ReadFile(manifestPath)
 	if os.IsNotExist(err) {
 		return false, nil
 	}
@@ -471,7 +478,7 @@ func RemoveManagedSessionForPayload(payloadPath string) (bool, error) {
 	manifest.State = "completed"
 	manifest.UpdatedAt = now
 	manifest.LastUsedAt = now
-	if err := writeSessionManifestAtomic(filepath.Join(dir, "session.json"), manifest); err != nil {
+	if err := writeSessionManifestAtomic(manifestPath, manifest); err != nil {
 		return true, err
 	}
 	storeRoot, ok := managedSessionStoreRootForDir(dir)

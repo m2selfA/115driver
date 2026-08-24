@@ -3,9 +3,11 @@ package transfer
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -238,6 +240,71 @@ func TestTouchManagedSessionForStatePathUpdatesPartsManifest(t *testing.T) {
 	}
 	if !after.UpdatedAt.After(old) || !after.LastUsedAt.After(old) {
 		t.Fatalf("managed state touch did not refresh timestamps: %#v", after)
+	}
+}
+
+func TestTouchManagedSessionForStatePathSerializesConcurrentWriters(t *testing.T) {
+	scope, err := SessionProfileScope(filepath.Join(t.TempDir(), "config.toml"), "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	identity, err := NewSessionIdentityV2("upload", "tree", scope, filepath.Join(t.TempDir(), "src"), "/Remote", "multipart", "directory")
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := SessionStore{Root: t.TempDir()}
+	location, _, err := store.Open(identity, "src", 42)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(location.PartsDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+
+	const workers = 12
+	const iterations = 8
+	start := make(chan struct{})
+	errs := make(chan error, workers)
+	var wg sync.WaitGroup
+	for worker := 0; worker < workers; worker++ {
+		statePath := filepath.Join(location.PartsDir, fmt.Sprintf("file-%02d.upload.json", worker))
+		wg.Add(1)
+		go func(path string) {
+			defer wg.Done()
+			<-start
+			for iteration := 0; iteration < iterations; iteration++ {
+				touched, touchErr := TouchManagedSessionForStatePath(path, true)
+				if touchErr != nil {
+					errs <- touchErr
+					return
+				}
+				if !touched {
+					errs <- fmt.Errorf("managed session unexpectedly disappeared")
+					return
+				}
+			}
+		}(statePath)
+	}
+	close(start)
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Fatalf("concurrent managed session touch failed: %v", err)
+	}
+
+	data, err := os.ReadFile(location.ManifestPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var manifest SessionManifest
+	if err := json.Unmarshal(data, &manifest); err != nil {
+		t.Fatalf("concurrent manifest writes left invalid JSON: %v", err)
+	}
+	if err := validateSessionManifest(manifest); err != nil {
+		t.Fatalf("concurrent manifest writes left invalid state: %v", err)
+	}
+	if manifest.State != "active" || manifest.SessionID != location.ID {
+		t.Fatalf("concurrent manifest writes changed identity/state: %#v", manifest)
 	}
 }
 
