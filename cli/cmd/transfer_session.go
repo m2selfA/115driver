@@ -279,11 +279,57 @@ func pathIsWithin(root, target string) (bool, error) {
 	if err != nil {
 		return false, err
 	}
+
+	// filepath.Rel cannot relate paths on different Windows volumes (for
+	// example a D: transfer source and the managed session store under C:).
+	// When the volume identities are unambiguously different, containment is
+	// therefore false and should not abort the transfer. Keep this comparison
+	// conservative: unusual device/extended path spellings may alias the same
+	// underlying volume, so those still fall through to filepath.Rel and fail
+	// closed if it cannot prove a relationship.
+	if pathVolumesDefinitelyDifferent(rootAbs, targetAbs) {
+		return false, nil
+	}
+
 	relative, err := filepath.Rel(rootAbs, targetAbs)
 	if err != nil {
 		return false, err
 	}
 	return relative == "." || relative != ".." && !strings.HasPrefix(relative, ".."+string(filepath.Separator)), nil
+}
+
+func pathVolumesDefinitelyDifferent(left, right string) bool {
+	leftVolume := filepath.VolumeName(left)
+	rightVolume := filepath.VolumeName(right)
+	if leftVolume == "" || rightVolume == "" {
+		return false
+	}
+
+	if isPlainWindowsDriveVolume(leftVolume) && isPlainWindowsDriveVolume(rightVolume) {
+		return !strings.EqualFold(leftVolume, rightVolume)
+	}
+	if isPlainUNCVolume(leftVolume) && isPlainUNCVolume(rightVolume) {
+		return !strings.EqualFold(filepath.Clean(leftVolume), filepath.Clean(rightVolume))
+	}
+	return false
+}
+
+func isPlainWindowsDriveVolume(volume string) bool {
+	if len(volume) != 2 || volume[1] != ':' {
+		return false
+	}
+	letter := volume[0]
+	return letter >= 'a' && letter <= 'z' || letter >= 'A' && letter <= 'Z'
+}
+
+func isPlainUNCVolume(volume string) bool {
+	normalized := strings.ReplaceAll(volume, "/", `\`)
+	if !strings.HasPrefix(normalized, `\\`) || strings.HasPrefix(normalized, `\\?\`) || strings.HasPrefix(normalized, `\\.\`) {
+		return false
+	}
+	remainder := strings.TrimPrefix(normalized, `\\`)
+	separator := strings.IndexByte(remainder, '\\')
+	return separator > 0 && separator < len(remainder)-1
 }
 
 func completedDownloadFileStillValid(root string, file transfer.TransferTreeSessionFile) (bool, int64, error) {

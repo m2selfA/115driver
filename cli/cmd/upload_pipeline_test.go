@@ -718,6 +718,39 @@ func TestRecursiveUploadModesUseDistinctDefaultSessions(t *testing.T) {
 	}
 }
 
+func TestPathIsWithinWindowsDifferentVolumesAreOutside(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("Windows cross-volume containment test")
+	}
+
+	source := `D:\scratch\drhuang\20260502`
+	session := `C:\Users\inter\.115driver\sessions\v2\upload\tree\nx\20260502--nxad46nzafx7tden7sydvyekkutc5wew\payload.json`
+	inside, err := pathIsWithin(source, session)
+	if err != nil {
+		t.Fatalf("cross-volume session containment returned an error: %v", err)
+	}
+	if inside {
+		t.Fatalf("cross-volume session path was considered inside source: source=%q session=%q", source, session)
+	}
+
+	inside, err = pathIsWithin(source, filepath.Join(source, "subdir", "payload.json"))
+	if err != nil {
+		t.Fatalf("same-volume containment returned an error: %v", err)
+	}
+	if !inside {
+		t.Fatal("same-volume child path was not considered inside source")
+	}
+
+	// An extended-length spelling may still refer to the same D: volume. The
+	// helper must never classify that uncertain representation as definitely
+	// outside, because callers rely on this check to reject in-tree sessions.
+	extendedChild := `\\?\D:\scratch\drhuang\20260502\payload.json`
+	inside, err = pathIsWithin(source, extendedChild)
+	if err == nil && !inside {
+		t.Fatalf("extended same-volume path was unsafely classified as outside: source=%q target=%q", source, extendedChild)
+	}
+}
+
 func TestDeriveTransferSessionPathsWindowsCaseInsensitive(t *testing.T) {
 	if runtime.GOOS != "windows" {
 		t.Skip("Windows path identity test")

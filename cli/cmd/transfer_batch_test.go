@@ -77,6 +77,49 @@ func TestValidateBatchUploadSourcesAcceptsDistinctFiles(t *testing.T) {
 	}
 }
 
+func TestBatchRecursiveUploadProcessesEachDirectorySource(t *testing.T) {
+	oldRun := uploadSingleRunE
+	oldRecursive, oldContents, oldSession := uploadRecursive, uploadContents, uploadSession
+	oldJSON, oldPrinter := jsonOutput, printer
+	t.Cleanup(func() {
+		uploadSingleRunE = oldRun
+		uploadRecursive, uploadContents, uploadSession = oldRecursive, oldContents, oldSession
+		jsonOutput, printer = oldJSON, oldPrinter
+	})
+
+	uploadRecursive = true
+	uploadContents = false
+	uploadSession = ""
+	jsonOutput = true
+	printer = output.NewPrinter(false)
+
+	root := t.TempDir()
+	sources := []string{filepath.Join(root, "20260502"), filepath.Join(root, "20260528")}
+	for _, source := range sources {
+		if err := os.MkdirAll(source, 0755); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	var calls [][]string
+	uploadSingleRunE = func(_ *cobra.Command, args []string) error {
+		calls = append(calls, append([]string(nil), args...))
+		return nil
+	}
+	cmd := &cobra.Command{}
+	if err := runBatchUploadCommand(cmd, []string{sources[0], sources[1], "/data/research/huangxiaojun/idpc"}); err != nil {
+		t.Fatal(err)
+	}
+	if len(calls) != 2 {
+		t.Fatalf("recursive batch processed %d source(s), want 2: %#v", len(calls), calls)
+	}
+	for i, source := range sources {
+		if len(calls[i]) != 2 || calls[i][0] != source || calls[i][1] != "/data/research/huangxiaojun/idpc" {
+			t.Fatalf("recursive batch call %d = %#v, want source=%q remote=%q", i, calls[i], source, "/data/research/huangxiaojun/idpc")
+		}
+	}
+}
+
 func TestPrepareBatchDownloadSourcesRejectsDuplicateBasenamesBeforeTransfer(t *testing.T) {
 	oldRecursive := downloadRecursive
 	t.Cleanup(func() { downloadRecursive = oldRecursive })
