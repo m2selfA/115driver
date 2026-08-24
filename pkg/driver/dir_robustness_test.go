@@ -109,6 +109,16 @@ func TestMkdirRejectsMalformedSuccessfulDirectoryID(t *testing.T) {
 	if err != nil || id != "123" {
 		t.Fatalf("Mkdir valid = %q, %v", id, err)
 	}
+
+	id, err = dirClientForBody(`{"state":true,"errno":"","cid":"456","cname":"child"}`).Mkdir("0", "child")
+	if err != nil || id != "456" {
+		t.Fatalf("Mkdir blank optional errno success = %q, %v", id, err)
+	}
+
+	id, err = dirClientForBody(`{"state":false,"errno":"","error":"failed"}`).Mkdir("0", "child")
+	if id != "" || !errors.Is(err, ErrUnexpected) {
+		t.Fatalf("Mkdir blank optional errno failure = %q, %v; want empty, ErrUnexpected", id, err)
+	}
 }
 
 func TestDirName2CIDHandlesRootAndRejectsMalformedLookup(t *testing.T) {

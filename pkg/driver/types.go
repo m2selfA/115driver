@@ -18,7 +18,15 @@ func (v *StringInt) UnmarshalJSON(b []byte) (err error) {
 	if b[0] == '"' {
 		var s string
 		if err = json.Unmarshal(b, &s); err == nil {
-			i, err = strconv.Atoi(s)
+			// Several 115 endpoints encode an absent optional integer as an
+			// empty JSON string instead of 0 or null. Preserve strict parsing
+			// for every non-empty value while treating that wire-level absence
+			// consistently with the zero value used by omitted/null fields.
+			if s == "" {
+				i = 0
+			} else {
+				i, err = strconv.Atoi(s)
+			}
 		}
 	} else {
 		err = json.Unmarshal(b, &i)

@@ -28,6 +28,16 @@ func TestScalarJSONTypesRejectEmptyInputWithoutPanicking(t *testing.T) {
 	}
 }
 
+func TestStringIntAcceptsEmptyQuotedOptionalValueAsZero(t *testing.T) {
+	value := StringInt(42)
+	if err := value.UnmarshalJSON([]byte(`""`)); err != nil {
+		t.Fatalf("StringInt empty quoted optional value: %v", err)
+	}
+	if value != 0 {
+		t.Fatalf("StringInt empty quoted optional value = %d, want 0", value)
+	}
+}
+
 func TestStringIntRejectsInvalidQuotedNumber(t *testing.T) {
 	var value StringInt
 	if err := value.UnmarshalJSON([]byte(`"not-an-int"`)); err == nil {

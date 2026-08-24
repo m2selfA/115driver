@@ -94,6 +94,31 @@ func TestPrepareRecursiveUploadDestinationPreservesSourceDirectoryByDefault(t *t
 	}
 }
 
+func TestPrepareRecursiveUploadDestinationCreatesEachMissingBatchSourceRoot(t *testing.T) {
+	parent := t.TempDir()
+	client := newFakeUploadTreeClient()
+	for _, name := range []string{"20260502", "20260528"} {
+		localRoot := filepath.Join(parent, name)
+		if err := os.MkdirAll(localRoot, 0755); err != nil {
+			t.Fatal(err)
+		}
+		destination, childID, err := prepareRecursiveUploadDestination(client, "/data/research/huangxiaojun/idpc", "root", localRoot, false)
+		if err != nil {
+			t.Fatalf("prepare %s: %v", name, err)
+		}
+		if destination != "/data/research/huangxiaojun/idpc/"+name || childID == "" || childID == "root" {
+			t.Fatalf("unexpected destination for %s: path=%q id=%q", name, destination, childID)
+		}
+	}
+	entries, err := client.List("root")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(*entries) != 2 || (*entries)[0].Name != "20260502" || (*entries)[1].Name != "20260528" {
+		t.Fatalf("unexpected batch source roots: %#v", *entries)
+	}
+}
+
 func TestPrepareRecursiveUploadDestinationContentsModeUsesParentDirectly(t *testing.T) {
 	client := newFakeUploadTreeClient()
 	destination, rootID, err := prepareRecursiveUploadDestination(client, "/data/research/idpc", "root", t.TempDir(), true)
