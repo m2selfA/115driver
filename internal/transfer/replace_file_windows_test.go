@@ -40,7 +40,10 @@ func TestReplaceDownloadedFileRetriesTransientWindowsShareDenial(t *testing.T) {
 	}
 	released := make(chan struct{})
 	go func() {
-		time.Sleep(60 * time.Millisecond)
+		// f58d0df retried for only ~355 ms total. Hold the destination long
+		// enough to prove the extended bounded retry window, matching the kind
+		// of longer non-share-delete hold observed from Windows background I/O.
+		time.Sleep(750 * time.Millisecond)
 		_ = windows.CloseHandle(handle)
 		close(released)
 	}()

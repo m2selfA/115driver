@@ -243,6 +243,40 @@ func TestTouchManagedSessionForStatePathUpdatesPartsManifest(t *testing.T) {
 	}
 }
 
+func TestTouchManagedSessionForStatePathCoalescesFreshManifestActivity(t *testing.T) {
+	scope, err := SessionProfileScope(filepath.Join(t.TempDir(), "config.toml"), "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	identity, err := NewSessionIdentityV2("upload", "tree", scope, filepath.Join(t.TempDir(), "src"), "/Remote", "multipart", "directory")
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := SessionStore{Root: t.TempDir()}
+	location, before, err := store.Open(identity, "src", 42)
+	if err != nil {
+		t.Fatal(err)
+	}
+	statePath := filepath.Join(location.PartsDir, "file.upload.json")
+	if err := os.MkdirAll(location.PartsDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if touched, err := TouchManagedSessionForStatePath(statePath, true); err != nil || !touched {
+		t.Fatalf("fresh managed touch failed: touched=%v err=%v", touched, err)
+	}
+	data, err := os.ReadFile(location.ManifestPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var after SessionManifest
+	if err := json.Unmarshal(data, &after); err != nil {
+		t.Fatal(err)
+	}
+	if !after.UpdatedAt.Equal(before.UpdatedAt) || !after.LastUsedAt.Equal(before.LastUsedAt) {
+		t.Fatalf("fresh activity rewrote manifest timestamps: before=%#v after=%#v", before, after)
+	}
+}
+
 func TestTouchManagedSessionForStatePathSerializesConcurrentWriters(t *testing.T) {
 	scope, err := SessionProfileScope(filepath.Join(t.TempDir(), "config.toml"), "main")
 	if err != nil {

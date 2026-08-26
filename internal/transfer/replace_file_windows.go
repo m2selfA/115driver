@@ -4,12 +4,16 @@ package transfer
 
 import (
 	"errors"
+	"fmt"
 	"time"
 
 	"golang.org/x/sys/windows"
 )
 
-const windowsReplaceRetryAttempts = 8
+const (
+	windowsReplaceRetryWindow   = 5 * time.Second
+	windowsReplaceMaxRetryDelay = 250 * time.Millisecond
+)
 
 func replaceDownloadedFile(from, to string) error {
 	fromPtr, err := windows.UTF16PtrFromString(from)
@@ -22,7 +26,8 @@ func replaceDownloadedFile(from, to string) error {
 	}
 
 	delay := 5 * time.Millisecond
-	for attempt := 0; attempt < windowsReplaceRetryAttempts; attempt++ {
+	deadline := time.Now().Add(windowsReplaceRetryWindow)
+	for {
 		err = windows.MoveFileEx(
 			fromPtr,
 			toPtr,
@@ -31,18 +36,26 @@ func replaceDownloadedFile(from, to string) error {
 		if err == nil {
 			return nil
 		}
-		if !isRetryableWindowsReplaceError(err) || attempt+1 == windowsReplaceRetryAttempts {
+		if !isRetryableWindowsReplaceError(err) {
 			return err
 		}
-		time.Sleep(delay)
-		if delay < 100*time.Millisecond {
+
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return fmt.Errorf("Windows replace remained blocked for %s: %w", windowsReplaceRetryWindow, err)
+		}
+		sleepFor := delay
+		if sleepFor > remaining {
+			sleepFor = remaining
+		}
+		time.Sleep(sleepFor)
+		if delay < windowsReplaceMaxRetryDelay {
 			delay *= 2
-			if delay > 100*time.Millisecond {
-				delay = 100 * time.Millisecond
+			if delay > windowsReplaceMaxRetryDelay {
+				delay = windowsReplaceMaxRetryDelay
 			}
 		}
 	}
-	return err
 }
 
 func isRetryableWindowsReplaceError(err error) bool {

@@ -22,6 +22,12 @@ const (
 	SessionManifestVersion  = 2
 )
 
+// Managed session manifests carry GC/activity metadata, while payload.json and
+// parts/* contain the authoritative resumable transfer state. Coalescing
+// timestamp-only manifest writes avoids thousands of atomic replacements during
+// large recursive transfers without weakening resume durability.
+const managedSessionManifestTouchInterval = 30 * time.Second
+
 var (
 	ErrSessionStore           = errors.New("session store is invalid")
 	ErrSessionAccountMismatch = errors.New("session belongs to a different account")
@@ -413,6 +419,9 @@ func TouchManagedSessionForStatePath(statePath string, persistentMutation bool) 
 		return true, err
 	}
 	now := time.Now().UTC()
+	if !managedSessionManifestTouchDue(manifest, persistentMutation, now) {
+		return true, nil
+	}
 	if persistentMutation {
 		manifest.UpdatedAt = now
 	}
@@ -421,6 +430,23 @@ func TouchManagedSessionForStatePath(statePath string, persistentMutation bool) 
 		return true, err
 	}
 	return true, nil
+}
+
+func managedSessionManifestTouchDue(manifest SessionManifest, persistentMutation bool, now time.Time) bool {
+	reference := manifest.LastUsedAt
+	if persistentMutation {
+		if manifest.UpdatedAt.IsZero() || manifest.LastUsedAt.IsZero() {
+			return true
+		}
+		reference = manifest.UpdatedAt
+		if manifest.LastUsedAt.Before(reference) {
+			reference = manifest.LastUsedAt
+		}
+	}
+	if reference.IsZero() || now.Before(reference) {
+		return true
+	}
+	return now.Sub(reference) >= managedSessionManifestTouchInterval
 }
 
 func managedSessionDirForStatePath(statePath string) (string, bool) {
